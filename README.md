@@ -1,30 +1,38 @@
 # check-updates
 
-Check Python dependency versions on PyPI. Run the command in the directory that contains `pyproject.toml`.
+檢查 `pyproject.toml` 中 Python dependencies 在 PyPI 上的最新穩定版本，並選擇要套用的更新。
+
+使用 [`uv`](https://docs.astral.sh/uv/getting-started/installation/) 的 `uvx` 執行，不需要將 check-updates 安裝到專案環境。工具只修改 dependency requirements，不會安裝套件、修改 lock file，或執行 `uv lock`、`uv sync`。
+
+## 快速開始
+
+在包含 `pyproject.toml` 的目錄執行：
 
 ```sh
-pip install check-updates
+# 列出可用更新，不修改檔案。
+uvx check-updates
 
-# List available updates without changing files.
-check-updates
+# 選擇更新、預覽 diff，確認後寫入。
+uvx check-updates -i
 
-# Apply updates to pyproject.toml.
-check-updates -u
-
-# List updates for the uv workspace root and members.
-check-updates -w
-
-# Apply updates across the uv workspace.
-check-updates -u -w
-
-# Select updates, preview changes, and confirm.
-check-updates -i
-
-# Select updates across the uv workspace.
-check-updates -i -w
+# 直接套用所有可用更新，不詢問確認。
+uvx check-updates -u
 ```
 
-Example output:
+更新後，請檢查變更並測試專案。若使用 uv 管理專案，可再自行執行 `uv lock` 或 `uv sync`。
+
+### 常用選項
+
+| 選項 | 用途 |
+| --- | --- |
+| `-i`, `--interactive` | 選擇更新，預覽 diff，確認後寫入 |
+| `-u`, `--upgrade` | 直接寫入所有可用更新 |
+| `-w`, `--workspace` | 檢查 uv workspace root 與所有納入的 members |
+| `--help` | 顯示命令說明 |
+
+`-i` 與 `-u` 不能同時使用；兩者都可以搭配 `-w`。不指定 `-i` 或 `-u` 時，只列出更新。
+
+### 輸出範例
 
 ```text
 Dependency updates
@@ -41,32 +49,48 @@ Change labels compare requirement versions, not installed versions or compatibil
 No files changed. Use -u to apply all updates or -i to select updates.
 ```
 
-Tables group updates by project file and show the original requirement, target version, change label, and dependency section. Long requirements wrap instead of being truncated. Terminal output uses colors; redirected output has no ANSI color codes. Workspace hints include `-w`.
+表格依專案檔案分組，顯示原始 requirement、目標版本、版本變更類型與 dependency section。長 requirement 會自動換行。終端輸出使用色彩，重新導向的輸出不含 ANSI 色碼。
 
-`--upgrade`, `--workspace`, and `--interactive` are the long forms of `-u`, `-w`, and `-i`.
+`major`、`minor`、`patch` 比較的是 requirement 中的版本，不是已安裝版本。未指定版本時標示為 `unbounded`；epoch 變更與其他 PEP 440 形式使用 `other`。這些標籤不代表相容性保證，包含版本低於 1.0 的套件。
 
-## Interactive Updates
+## 互動更新
 
-Interactive mode requires terminal input and output. `-i` cannot be combined with `-u`. Invalid combinations or non-terminal input or output return exit code 2 before file reads or PyPI lookups. Listing commands and `-u` remain non-interactive.
+```sh
+uvx check-updates -i
+```
 
-The command completes reads and lookups before showing a selector. Entries start unchecked and are grouped by project file. Each entry shows its dependency section, original requirement, target version, and version-change label. Repeated dependencies can be selected separately.
+工具會先讀取檔案並完成 PyPI 查詢，再顯示選單。更新項目依專案檔案分組，預設全部未選取；重複出現的 dependency 可以分別選取。
 
-- Arrow keys move between entries and project actions.
-- Space toggles an entry. On a project action, Space selects all updates if any are unchecked; otherwise it clears the project.
-- Enter reviews the selection. An empty selection exits without writing.
-- Escape cancels without writing. Ctrl+C exits with code 130. Closed prompt input also cancels without writing.
+| 按鍵 | 操作 |
+| --- | --- |
+| 方向鍵 | 移動至更新項目或專案操作 |
+| Space | 切換項目的選取狀態；在專案操作上可全選或清除該專案 |
+| Enter | 預覽已選取更新；沒有選取時直接結束 |
+| Escape | 取消，不寫入檔案 |
+| Ctrl+C | 中止，exit code 為 `130` |
 
-Labels `major`, `minor`, and `patch` compare numeric release components against the requirement's version, not an installed version. `unbounded` means no version was specified. Epoch changes and other PEP 440 forms use `other`. Labels do not prove compatibility, including for packages below version 1.0.
+選取後會顯示 unified diff，以及 dependency 與檔案數量。`Apply these changes?` 預設為 No：按 `y` 套用、`n` 取消，或以方向鍵、Space 切換後按 Enter。只有已選取的更新會寫入。
 
-After selection, the command shows unified diffs and dependency and file counts. `Apply these changes?` defaults to No. Enter keeps the default; arrows or Space change the choice. Press `y` to apply or `n` to cancel. Escape cancels here too. Only selected updates are written, using the exact content prepared for the preview. Diff display normalizes CRLF to LF and escapes other control characters; written bytes are unchanged by display formatting.
+互動模式需要終端輸入與輸出。自動化流程請使用不需互動的 `uvx check-updates` 或 `uvx check-updates -u`。
 
-Before writing, the command checks every affected file against its original bytes. If a file was edited, deleted, or became unreadable during review, it returns exit code 1 without writing any files. This check does not prevent concurrent edits after the check. Comments, quotes, extras, markers, and line endings are preserved.
+寫入前會確認所有受影響檔案仍與讀取時相同。如果檔案在預覽期間被修改、刪除或變成無法讀取，工具會停止且不寫入任何檔案。此檢查無法防止檢查完成後的並行修改。
 
-Workspace writes are sequential, not transactional. A write failure returns exit code 1 and reports the failing path; earlier successful updates remain listed in output. Review those files and use the displayed diff or version control to restore requirements if needed. The command does not reset user edits.
+## uv workspace
 
-## Workspaces
+加上 `-w` 可檢查 workspace root 與所有納入的 members：
 
-With `-w`, the command finds the nearest `pyproject.toml` with `[tool.uv.workspace]` in the current directory or its parents. It checks the root and each declared member, using the `members` and `exclude` glob patterns. Run it from the workspace root, a member, or a member subdirectory.
+```sh
+# 列出整個 workspace 的更新。
+uvx check-updates -w
+
+# 選擇並確認 workspace 更新。
+uvx check-updates -i -w
+
+# 直接套用整個 workspace 的更新。
+uvx check-updates -u -w
+```
+
+可從 workspace root、member 或 member 子目錄執行。工具會從目前目錄向上尋找最近的、含有 `[tool.uv.workspace]` 的 `pyproject.toml`，並依 `members` 與 `exclude` 的 glob patterns 選取專案：
 
 ```toml
 [tool.uv.workspace]
@@ -74,28 +98,43 @@ members = ["packages/*"]
 exclude = ["packages/seeds"]
 ```
 
-Workspace output identifies each project file. PyPI results are shared across projects. Dependencies marked with `workspace = true` or an external workspace path in `[tool.uv.sources]` are skipped. Root source definitions apply to members unless overridden by a member. External workspaces are not traversed.
+- 輸出會標明每個專案檔案，PyPI 查詢結果會在專案間共用。
+- `[tool.uv.sources]` 中標記為 `workspace = true` 或指向外部 workspace 的 dependencies 會略過；不會繼續檢查外部 workspace。
+- Root 的 source 定義會套用至 members，除非 member 有自己的覆寫。
+- 找不到 workspace、選取的 member 缺少 `pyproject.toml`，或讀取與查詢失敗時，工具會停止並回傳 exit code `1`。
 
-If the workspace is missing, a selected member has no `pyproject.toml`, or a file or lookup fails, the command returns exit code 1. All files are read and all lookups finish before any updates are written. File-write failures can leave earlier files updated; multi-file writes are not transactional.
+未使用 `-w` 時，只檢查目前目錄的 `pyproject.toml`。Workspace 探索遵循 [uv workspace 設定](https://docs.astral.sh/uv/concepts/projects/workspaces/#getting-started)，不會執行 uv。
 
-Without `-w`, only the current directory's `pyproject.toml` is checked.
+## 更新範圍與限制
 
-Workspace discovery follows [uv workspace configuration](https://docs.astral.sh/uv/concepts/projects/workspaces/#getting-started). It does not run uv.
+- 檢查 `[project].dependencies`、`[project.optional-dependencies]` 與 `[dependency-groups]`。
+- 選取 PyPI 上至少有一個未被 yanked 的 distribution file 的最高穩定版本，忽略 prereleases 與 development releases。
+- 更新單一 `>=`、`==`、`~=` version constraint；沒有 version constraint 時加入 `>=VERSION`。不會降低現有版本。
+- 保留 extras、environment markers、註解、引號、TOML 格式與換行形式。帶有 marker 的 dependency 仍會檢查，不受目前環境影響。
+- 回報並略過 URL dependencies、wildcard pins、多重 constraints、排除條件、版本上限與嚴格的 `>` 下限。Dependency-group include entries 保持不變。
 
-## Behavior
+工具不會解析 dependency 相依關係，也不會檢查 Python 版本相容性。安裝更新前，請自行確認相容性。
 
-- Checks `[project].dependencies`, `[project.optional-dependencies]`, and `[dependency-groups]`.
-- Selects the highest stable PyPI release with a non-yanked distribution file. Ignores prereleases and development releases.
-- Updates single `>=`, `==`, and `~=` version constraints. Adds `>=VERSION` to requirements without a version constraint. Does not lower existing versions.
-- Preserves extras, environment markers, comments, and TOML formatting. Checks marked dependencies regardless of the current environment.
-- Reports and skips URL dependencies, wildcard pins, multiple constraints, exclusions, upper bounds, and strict `>` bounds. Dependency-group include entries remain unchanged.
-- Returns exit code 1 for file, parsing, or network errors. Completes all lookups before applying updates, so lookup failures do not cause partial edits.
+所有檔案讀取與 PyPI 查詢都會在寫入前完成，因此查詢失敗不會造成部分更新。但多檔案寫入是依序執行，並非 transaction：若寫入失敗，先前成功的更新會保留。請依輸出與 version control 檢查或還原變更。
 
-The command does not resolve dependencies or check Python-version compatibility. Review updates before installing them. It reads uv workspace configuration only with `-w`. It does not install packages, change lock files, or run `uv lock` or `uv sync`.
+### Exit codes
 
-## Development
+| Code | 意義 |
+| --- | --- |
+| `0` | 正常完成，包含沒有更新、沒有選取或取消確認 |
+| `1` | 檔案、解析或網路錯誤 |
+| `2` | 無效選項組合，或互動模式沒有終端輸入與輸出 |
+| `130` | 由 Ctrl+C 中止 |
 
-After installing the project and development dependencies, run checks without updating the environment or lock file:
+## 開發
+
+在 repository 中安裝開發環境：
+
+```sh
+uv sync --frozen
+```
+
+執行檢查，不更新環境或 lock file：
 
 ```sh
 uv run --frozen --no-sync pytest
