@@ -16,6 +16,12 @@ check-updates -w
 
 # Apply updates across the uv workspace.
 check-updates -u -w
+
+# Select updates, preview changes, and confirm.
+check-updates -i
+
+# Select updates across the uv workspace.
+check-updates -i -w
 ```
 
 Example output:
@@ -24,7 +30,26 @@ Example output:
 "typer>=0.27.1" -> 0.27.3
 ```
 
-`--upgrade` is the long form of `-u`. `--workspace` is the long form of `-w`.
+`--upgrade`, `--workspace`, and `--interactive` are the long forms of `-u`, `-w`, and `-i`.
+
+## Interactive Updates
+
+Interactive mode requires terminal input and output. `-i` cannot be combined with `-u`. Invalid combinations or non-terminal input or output return exit code 2 before file reads or PyPI lookups. Listing commands and `-u` remain non-interactive.
+
+The command completes reads and lookups before showing a selector. Entries start unchecked and are grouped by project file. Each entry shows its dependency section, original requirement, target version, and version-change label. Repeated dependencies can be selected separately.
+
+- Arrow keys move between entries and project actions.
+- Space toggles an entry. On a project action, Space selects all updates if any are unchecked; otherwise it clears the project.
+- Enter reviews the selection. An empty selection exits without writing.
+- Escape cancels without writing. Ctrl+C exits with code 130. Closed prompt input also cancels without writing.
+
+Labels `major`, `minor`, and `patch` compare numeric release components against the requirement's version, not an installed version. `unbounded` means no version was specified. Epoch changes and other PEP 440 forms use `other`. Labels do not prove compatibility, including for packages below version 1.0.
+
+After selection, the command shows unified diffs and dependency and file counts. `Apply these changes?` defaults to No. Enter keeps the default; arrows or Space change the choice. Press `y` to apply or `n` to cancel. Escape cancels here too. Only selected updates are written, using the exact content prepared for the preview. Diff display normalizes CRLF to LF and escapes other control characters; written bytes are unchanged by display formatting.
+
+Before writing, the command checks every affected file against its original bytes. If a file was edited, deleted, or became unreadable during review, it returns exit code 1 without writing any files. This check does not prevent concurrent edits after the check. Comments, quotes, extras, markers, and line endings are preserved.
+
+Workspace writes are sequential, not transactional. A write failure returns exit code 1 and reports the failing path; earlier successful updates remain listed in output. Review those files and use the displayed diff or version control to restore requirements if needed. The command does not reset user edits.
 
 ## Workspaces
 
