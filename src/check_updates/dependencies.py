@@ -22,6 +22,7 @@ class Dependency:
     array: Array
     index: int
     requirement: str
+    section: tuple[str, ...]
 
 
 @dataclass
@@ -34,15 +35,18 @@ class Update:
 def dependencies(document: TOMLDocument) -> Iterator[Dependency]:
     """Visit package requirements, excluding dependency-group include tables."""
     project = document.get("project", {})
-    arrays = [project.get("dependencies", [])]
-    arrays.extend(project.get("optional-dependencies", {}).values())
-    arrays.extend(document.get("dependency-groups", {}).values())
-    for array in arrays:
+    arrays = [(("project", "dependencies"), project.get("dependencies", []))]
+    arrays.extend(
+        (("project", "optional-dependencies", name), array)
+        for name, array in project.get("optional-dependencies", {}).items()
+    )
+    arrays.extend((("dependency-groups", name), array) for name, array in document.get("dependency-groups", {}).items())
+    for section, array in arrays:
         if not isinstance(array, Array):
             continue
         for index, item in enumerate(array):
             if isinstance(item, str):
-                yield Dependency(array, index, str(item))
+                yield Dependency(array, index, str(item), section)
 
 
 def latest_version(name: str) -> Version:

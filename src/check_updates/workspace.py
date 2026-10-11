@@ -15,11 +15,13 @@ from tomlkit.toml_document import TOMLDocument
 class Project:
     path: Path
     document: TOMLDocument
+    original: bytes
 
 
 def read_project(path: Path) -> Project:
     try:
-        return Project(path, tomlkit.parse(path.read_bytes().decode("utf-8")))
+        original = path.read_bytes()
+        return Project(path, tomlkit.parse(original.decode("utf-8")), original)
     except (OSError, ValueError, ParseError) as error:
         msg = f"Cannot read {path}: {error}"
         raise ValueError(msg) from error
