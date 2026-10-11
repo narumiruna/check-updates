@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 from dataclasses import field
 
-from packaging.requirements import Requirement
-from packaging.version import Version
 from prompt_toolkit.application import Application
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.key_binding import KeyBindings
@@ -15,24 +13,8 @@ from prompt_toolkit.layout import Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 
 from check_updates.dependencies import Update
+from check_updates.dependencies import version_change as version_change
 from check_updates.workspace import Project
-
-
-def version_change(update: Update) -> str:
-    """Describe the requirement baseline, not compatibility or an installed version."""
-    specs = list(Requirement(update.dependency.requirement).specifier)
-    if not specs:
-        return "unbounded"
-    before = Version(specs[0].version)
-    after = update.version
-    if before.epoch != after.epoch or any(
-        version.is_prerelease or version.is_postrelease or version.local or len(version.release) > 3
-        for version in (before, after)
-    ):
-        return "other"
-    old = (*before.release, 0, 0)[:3]
-    new = (*after.release, 0, 0)[:3]
-    return next((label for index, label in enumerate(("major", "minor", "patch")) if old[index] != new[index]), "other")
 
 
 def _cancellation_bindings() -> KeyBindings:

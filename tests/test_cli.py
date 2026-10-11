@@ -25,7 +25,13 @@ def test_list_does_not_edit(project):
     original = project.read_bytes()
     result = runner.invoke(cli.app)
     assert result.exit_code == 0, result.output
-    assert '"typer>=0.27.1" -> 0.27.3' in result.output
+    assert "Current requirement" in result.output
+    assert "typer>=0.27.1" in result.output
+    assert "0.27.3" in result.output
+    assert "patch" in result.output
+    assert "1 dependency with updates in 1 file." in result.output
+    assert "No files changed." in result.output
+    assert "\x1b[" not in result.output
     assert project.read_bytes() == original
 
 
