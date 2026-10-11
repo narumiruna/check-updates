@@ -32,6 +32,23 @@ class Update:
     version: Version
 
 
+def version_change(update: Update) -> str:
+    """Describe the requirement baseline, not compatibility or an installed version."""
+    specs = list(Requirement(update.dependency.requirement).specifier)
+    if not specs:
+        return "unbounded"
+    before = Version(specs[0].version)
+    after = update.version
+    if before.epoch != after.epoch or any(
+        version.is_prerelease or version.is_postrelease or version.local or len(version.release) > 3
+        for version in (before, after)
+    ):
+        return "other"
+    old = (*before.release, 0, 0)[:3]
+    new = (*after.release, 0, 0)[:3]
+    return next((label for index, label in enumerate(("major", "minor", "patch")) if old[index] != new[index]), "other")
+
+
 def dependencies(document: TOMLDocument) -> Iterator[Dependency]:
     """Visit package requirements, excluding dependency-group include tables."""
     project = document.get("project", {})

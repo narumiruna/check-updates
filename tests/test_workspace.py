@@ -52,6 +52,9 @@ def test_workspace_listing_does_not_edit(workspace, flag):
     assert f"{root}:" in result.output
     assert f"{member}:" in result.output
     assert "workspace dependency" in result.output
+    assert "3 dependencies with updates in 2 files." in result.output
+    assert "Use -u -w" in result.output
+    assert "-i -w" in result.output
     assert calls == ["typer", "pytest"]
     assert all(path.read_bytes() == content for path, content in originals.items())
 

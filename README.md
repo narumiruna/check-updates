@@ -27,8 +27,21 @@ check-updates -i -w
 Example output:
 
 ```text
-"typer>=0.27.1" -> 0.27.3
+Dependency updates
+
+pyproject.toml:
+╭─────────────────────┬────────┬────────┬──────────────────────╮
+│ Current requirement │ Target │ Change │ Section              │
+├─────────────────────┼────────┼────────┼──────────────────────┤
+│ typer>=0.27.1       │ 0.27.3 │ patch  │ project.dependencies │
+╰─────────────────────┴────────┴────────┴──────────────────────╯
+
+1 dependency with updates in 1 file.
+Change labels compare requirement versions, not installed versions or compatibility.
+No files changed. Use -u to apply all updates or -i to select updates.
 ```
+
+Tables group updates by project file and show the original requirement, target version, change label, and dependency section. Long requirements wrap instead of being truncated. Terminal output uses colors; redirected output has no ANSI color codes. Workspace hints include `-w`.
 
 `--upgrade`, `--workspace`, and `--interactive` are the long forms of `-u`, `-w`, and `-i`.
 

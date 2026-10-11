@@ -22,6 +22,7 @@ from check_updates.dependencies import replacement
 from check_updates.dependencies import unsupported_reason
 from check_updates.interactive import confirm_changes
 from check_updates.interactive import select_updates
+from check_updates.output import show_updates
 from check_updates.workspace import Project
 from check_updates.workspace import load_projects
 from check_updates.workspace import workspace_dependencies
@@ -59,14 +60,6 @@ def _collect_updates(workspace: bool) -> list[tuple[Project, list[Update]]]:
         if updates:
             pending.append((project, updates))
     return pending
-
-
-def _show_updates(pending: list[tuple[Project, list[Update]]], *, workspace: bool) -> None:
-    for project, updates in pending:
-        if workspace:
-            typer.echo(f"{project.path}:")
-        for update in updates:
-            typer.echo(f'"{update.dependency.requirement}" -> {update.version}')
 
 
 def _interactive_changes(pending: list[tuple[Project, list[Update]]]) -> list[Change]:
@@ -115,7 +108,7 @@ def main(
         elif interactive:
             _write_changes(_interactive_changes(pending))
         else:
-            _show_updates(pending, workspace=workspace)
+            show_updates(pending, upgrade=upgrade, workspace=workspace)
             if upgrade:
                 _write_changes([prepare_change(project, updates) for project, updates in pending])
     except KeyboardInterrupt as error:
