@@ -8,7 +8,7 @@ authors         = [{ name = "narumi", email = "toucans-cutouts0f@icloud.com" }]
 dependencies    = [
   "packaging>=26.3",
   "prompt-toolkit>=3.0.53,<4",
-  "rich>=14.3.4",
+  "rich>=15.0.0",
   "tomlkit>=0.15.1",
   "typer>=0.27.3",
 ]
