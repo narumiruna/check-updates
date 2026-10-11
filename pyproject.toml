@@ -8,7 +8,7 @@ authors         = [{ name = "narumi", email = "toucans-cutouts0f@icloud.com" }]
 dependencies    = [
   "packaging>=25.0",
   "tomlkit>=0.13.3",
-  "typer>=0.27.1",
+  "typer>=0.27.3",
 ]
 
 [project.scripts]
