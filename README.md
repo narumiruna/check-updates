@@ -1,6 +1,6 @@
 # check-updates
 
-Check Python dependencies in `pyproject.toml` for newer stable releases on PyPI, then choose which updates to apply.
+Check Python dependencies in `pyproject.toml` for newer stable releases on PyPI or configured package indexes, then choose which updates to apply.
 
 Run with `uvx`, provided by [`uv`](https://docs.astral.sh/uv/getting-started/installation/), without installing check-updates into your project environment. The tool only changes dependency requirements. It does not install packages, change lock files, or run `uv lock` or `uv sync`.
 
@@ -28,10 +28,53 @@ Review the changes and test your project after updating. If you manage the proje
 | `-i`, `--interactive` | Select updates, preview diffs, and confirm before writing |
 | `-u`, `--upgrade` | Write all available updates |
 | `-w`, `--workspace` | Check the uv workspace root and all included members |
+| `--target patch\|minor\|latest` | Limit updates relative to the requirement baseline; default: `latest` |
+| `--include NAME` | Include a package; repeat for multiple packages |
+| `--exclude NAME` | Exclude a package; repeat for multiple packages |
+| `--runtime` | Select `[project].dependencies` |
+| `--group NAME` | Select a dependency group; repeat for multiple groups |
+| `--extra NAME` | Select an optional-dependency extra; repeat for multiple extras |
+| `--format table\|json` | Use a table (default) or read-only JSON output |
+| `--check` | Do not write; return exit code `3` when updates exist |
+| `--diff` | Show a read-only unified diff without a table |
+| `--index URL` | Use a Simple index; repeat in first-match priority order |
+| `--no-cache` | Bypass persistent public PyPI cache reads and writes |
 | `--debug` | Write detailed diagnostics and error tracebacks to stderr |
 | `--help` | Show command help |
 
-`-i` and `-u` cannot be combined. Both can be used with `-w`. Without `-i` or `-u`, the command only lists updates.
+`-i` and `-u` cannot be combined. Both can be used with `-w` and selection options. `--check`, `--diff`, and `--format json` cannot be combined with `-i` or `-u`. `--check` can accompany JSON or diff output; JSON and diff cannot be combined. Without `-i` or `-u`, no project files are changed.
+
+## Update selection
+
+```sh
+# Only patch updates for the named packages.
+uvx check-updates --target patch --include typer --include rich
+
+# Upgrade a development group but leave one package unchanged.
+uvx check-updates -u --group dev --exclude pytest
+
+# Review runtime dependencies and an optional extra together.
+uvx check-updates --runtime --extra test --diff
+```
+
+Package matching uses exact normalized names: case, hyphens, underscores, and dots are equivalent. There are no glob patterns. Exclusions take precedence over inclusions. Without section options, every supported section is checked. Section options select their union; package filters further restrict that union. Group includes are left unchanged and are not expanded. A nonexistent group, extra, or package filter selects nothing.
+
+`patch` keeps the baseline's major and minor components; `minor` keeps its major component. Both exclude epoch changes. `latest` allows any newer stable version admitted by preserved upper bounds and exclusions. The baseline is the requirement's version, not an installed or locked version. Requirements without a baseline are skipped in patch/minor mode. These labels follow numeric release components, including for packages below version 1.0, and do not guarantee compatibility.
+
+## Automation and previews
+
+```sh
+# Exit 3 if selected dependencies have updates; exit 0 otherwise.
+uvx check-updates --check
+
+# Structured output with the same CI exit-code behavior.
+uvx check-updates -w --format json --check
+
+# Preview all selected changes without interactive input or writes.
+uvx check-updates --diff --target minor
+```
+
+JSON stdout is one object with `schema_version: 1` and an `updates` array. Each occurrence includes `file`, original `requirement`, `replacement`, target `version`, `section` (an array of path components), dependency-array `index`, `change`, `release_url`, and `project_release_url`. Links are nullable. Repeated requirements are separate occurrences. An empty result is `{"schema_version": 1, "updates": []}`. Diagnostics and skip messages go to stderr. Errors return code `1` without a partial JSON result. Diff output is empty when no changes are available.
 
 ### Debug diagnostics
 
@@ -70,7 +113,7 @@ Tables group updates by project file and show the original requirement, target v
 uvx check-updates -i
 ```
 
-The command reads files and completes PyPI lookups before showing the selector. Entries are grouped by project file and start unchecked. Repeated dependencies can be selected separately.
+The command reads files and completes index lookups before showing the selector. Entries are grouped by project file and start unchecked. Repeated dependencies can be selected separately.
 
 | Key | Action |
 | --- | --- |
@@ -80,7 +123,7 @@ The command reads files and completes PyPI lookups before showing the selector. 
 | Escape | Cancel without writing |
 | Ctrl+C | Exit with code `130` |
 
-After selection, the command shows unified diffs and dependency and file counts. `Apply these changes?` defaults to No. Press `y` to apply or `n` to cancel, or use arrows or Space to change the choice and Enter to confirm. Only selected updates are written.
+After selection, the command shows unified diffs, release links, and dependency and file counts. Public PyPI links point to the target release; project release-note links are included when PyPI advertises a safe HTTP(S) `Changelog`, `Release notes`, or `Releases` URL. Configured indexes provide a credential-free package page instead. Links are displayed, not opened automatically. `Apply these changes?` defaults to No. Press `y` to apply or `n` to cancel, or use arrows or Space to change the choice and Enter to confirm. Only selected updates are written.
 
 Interactive mode requires terminal input and output. For automation, use the non-interactive `uvx check-updates` or `uvx check-updates -u`.
 
@@ -119,16 +162,56 @@ Without `-w`, only the current directory's `pyproject.toml` is checked. Dependen
 ## Update scope and limitations
 
 - Checks `[project].dependencies`, `[project.optional-dependencies]`, and `[dependency-groups]`.
-- Selects the highest stable PyPI release with at least one non-yanked distribution file. Ignores prereleases and development releases.
-- Updates single `>=`, `==`, and `~=` version constraints. Adds `>=VERSION` to requirements without a version constraint. Does not lower existing versions.
+- Selects the highest eligible stable release with at least one non-yanked distribution file. Ignores prereleases and development releases. Applies target limits and Python metadata filtering before selection.
+- Updates single `>=`, `==`, and `~=` version constraints. Also supports one `>=` lower bound combined with `<`/`<=` upper bounds or `!=` exclusions, including wildcard exclusions. Only the lower bound changes; the target must satisfy all preserved bounds and exclusions. Adds `>=VERSION` to bare requirements in `latest` mode. Does not lower existing versions.
 - Preserves extras, environment markers, comments, quotes, TOML formatting, and line endings. Checks marked dependencies regardless of the current environment.
-- Reports and skips URL dependencies, wildcard pins, multiple constraints, exclusions, upper bounds, and strict `>` bounds. Dependency-group include entries remain unchanged.
+- Reports and skips URL dependencies, wildcard pins, upper-bound-only or exclusion-only requirements, strict `>` bounds, and ambiguous composites such as multiple lower bounds or `==`/`~=` combined with other constraints. Dependency-group include entries remain unchanged.
 
-Only public PyPI is queried; private index settings are not read. A PyPI 404 stops the check with a message naming the package and suggesting checks for misspellings, private or unpublished packages, and uv workspace configuration. A 404 alone does not identify a private package, so it is not silently skipped. No files are written when a lookup fails.
+### Python metadata filtering
 
-The tool does not resolve dependencies or check Python-version compatibility. Check compatibility before installing updates.
+When `[project].requires-python` exists, the tool uses its lowest admitted final version as a metadata baseline, not the running interpreter. The range must have an inclusive `>=` or `~=` floor; additional `>=`, `~=`, `<`, `<=`, and `!=` clauses are allowed only when that floor is admitted. Unsupported or inconsistent ranges stop the check rather than guessing.
 
-All file reads and PyPI lookups finish before writing, so lookup failures do not cause partial updates. Multi-file writes are sequential, not transactional: if a write fails, earlier successful updates remain. Use the output and version control to review or restore changes.
+A release is eligible if at least one non-yanked file has a `Requires-Python` range admitting that baseline. Missing metadata remains eligible; malformed ranges are ineligible when filtering is active. Each workspace project uses its own baseline. Without `requires-python`, no Python filtering is performed.
+
+This does **not** prove support for the project's entire Python range, wheel platform availability, transitive dependencies, or runtime compatibility. The tool does not resolve dependencies. Review release notes, resolve, and test before installing updates.
+
+### Package indexes and authentication
+
+Without index configuration, public PyPI's JSON API is used. Configure private indexes using PEP 503 HTML or PEP 691 JSON Simple endpoints:
+
+```sh
+uvx check-updates --index https://packages.example.com/simple/
+```
+
+Repeated `--index` options override project index configuration and replace the implicit public PyPI fallback. To include public PyPI explicitly, append `--index https://pypi.org/simple/`. Versions come only from the first index that contains the package. A 404 tries the next index; an empty or fully yanked package page does not. Authentication, parsing, and other lookup errors stop the check without writing project files.
+
+Simple indexes must advertise wheel or source-distribution filenames; download files are not fetched. The tool also reads project `[[tool.uv.index]]` and named `[tool.uv.sources]` index assignments:
+
+```toml
+[[tool.uv.index]]
+name = "internal"
+url = "https://packages.example.com/simple/"
+explicit = true
+
+[tool.uv.sources]
+internal-package = { index = "internal" }
+```
+
+With `-w`, root definitions are inherited and member definitions override matching names. Non-explicit indexes are tried in declaration order, with `default = true` indexes last. A default index replaces the implicit PyPI fallback. Explicit indexes are queried only for packages assigned to them. A named source uses only that index and never falls back. Undefined names and marker-specific index assignments are errors; marker-dependent routing is not evaluated. Global uv configuration, pip configuration, keyrings, and index-strategy settings are not read.
+
+For named indexes, supply HTTP Basic credentials using `UV_INDEX_INTERNAL_USERNAME` and `UV_INDEX_INTERNAL_PASSWORD` (uppercase the index name and replace hyphens with underscores). Alternatively, credentials can be URL-encoded in the URL userinfo; environment credentials override URL credentials. Prefer the named-index environment method so secrets do not appear in shell history or process arguments. Authenticated requests require HTTPS. URLs with queries or fragments are rejected. Cross-origin redirects and HTTPS downgrades are rejected; same-origin redirects retain authentication.
+
+Index errors and debug tracebacks do not expose credentials or private response bodies. Output links omit URL userinfo. Paths and package names can still be sensitive. Private-index metadata is kept only in memory for the invocation and is never written to disk.
+
+A public PyPI 404 stops the check with a message naming the package and suggesting checks for misspellings, private or unpublished packages, and workspace configuration. No files are written when a lookup fails.
+
+### Cache and retries
+
+Public PyPI release metadata is cached for one hour under `$XDG_CACHE_HOME/check-updates`, or `~/.cache/check-updates` when that variable is unset. The cache stores versions, Python constraints, and a safe public release-note link; it does not store credentials or response bodies. Corrupt or expired entries are fetched again. Cache-write failures do not fail the check. Use `--no-cache` for fresh lookups without persistent reads or writes. Per-invocation metadata sharing still applies.
+
+Metadata requests use a 15-second timeout and up to three attempts. Network connection failures and HTTP `408`, `429`, `500`, `502`, `503`, and `504` are retried after 0.25 and 0.5 seconds. Other HTTP errors are not retried. No dependency files are written until all lookups succeed.
+
+All file reads and index lookups finish before writing, so lookup failures do not cause partial updates. Multi-file writes are sequential, not transactional: if a write fails, earlier successful updates remain. Use the output and version control to review or restore changes.
 
 ### Exit codes
 
@@ -136,7 +219,8 @@ All file reads and PyPI lookups finish before writing, so lookup failures do not
 | --- | --- |
 | `0` | Completed, including no available updates, no selection, or cancelled confirmation |
 | `1` | File, parsing, or network error |
-| `2` | Invalid option combination, or interactive mode without terminal input and output |
+| `2` | Invalid option value/combination, or interactive mode without terminal input and output |
+| `3` | `--check` found updates within the selected scope |
 | `130` | Interrupted with Ctrl+C |
 
 ## Development

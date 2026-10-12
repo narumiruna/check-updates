@@ -10,6 +10,10 @@ from typer.testing import CliRunner
 
 from check_updates import cli
 from check_updates import dependencies as dependency_module
+from check_updates.indexes import Release
+from check_updates.indexes import ReleaseClient
+
+public_lookup = ReleaseClient._public
 
 runner = CliRunner()
 
@@ -17,7 +21,7 @@ runner = CliRunner()
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "latest_version", lambda _name: Version("0.27.3"))
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(Version("0.27.3"))])
     path = tmp_path / "pyproject.toml"
     path.write_text('[project]\ndependencies = [\n  "typer>=0.27.1", # Keep this comment.\n]\n')
     return path
@@ -64,7 +68,7 @@ def test_groups_extras_markers_quotes_and_cache(project, monkeypatch):
         calls.append(name)
         return Version("0.27.3")
 
-    monkeypatch.setattr(cli, "latest_version", fetch)
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(fetch(name))])
     result = runner.invoke(cli.app, ["-u"])
     assert result.exit_code == 0, result.output
     assert project.read_bytes() == original.replace(b"0.27.1", b"0.27.3")
@@ -94,7 +98,6 @@ def test_supported_requirements(project, requirement, expected):
 @pytest.mark.parametrize(
     "requirement",
     [
-        "typer>=0.27.1,<0.28",
         "typer==0.27.*",
         "typer!=0.27.1",
         "typer<0.28",
@@ -109,7 +112,7 @@ def test_unsupported_entries_are_skipped_without_network(project, monkeypatch, r
     def unexpected_fetch(_name):
         pytest.fail("Skipped dependencies must not trigger network requests.")
 
-    monkeypatch.setattr(cli, "latest_version", unexpected_fetch)
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(unexpected_fetch(name))])
     result = runner.invoke(cli.app, ["-u"])
     assert result.exit_code == 0, result.output
     assert "Skipped" in result.output
@@ -141,7 +144,7 @@ def test_network_failure_does_not_apply_partial_updates(project, monkeypatch):
             raise URLError("unavailable")
         return Version("0.27.3")
 
-    monkeypatch.setattr(cli, "latest_version", fetch)
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(fetch(name))])
     result = runner.invoke(cli.app, ["-u"])
     assert result.exit_code == 1
     assert "unavailable" in result.output
@@ -172,7 +175,7 @@ def test_pypi_uses_highest_stable_non_yanked_release(monkeypatch):
         calls.append((url, timeout))
         return io.BytesIO(json.dumps({"releases": releases}).encode())
 
-    monkeypatch.setattr(dependency_module, "urlopen", open_url)
+    monkeypatch.setattr(ReleaseClient, "_read", lambda self, request: (open_url(request.full_url, 15).read(), ""))
     assert dependency_module.latest_version("Some_Package") == Version("1.5")
     assert calls == [("https://pypi.org/pypi/some-package/json", 15)]
 
@@ -181,21 +184,21 @@ def test_pypi_uses_highest_stable_non_yanked_release(monkeypatch):
 def test_pypi_not_found_has_actionable_error_without_writes(project, monkeypatch, flags):
     project.write_text('[project]\ndependencies = ["typer>=0.27.1", "private-package"]\n')
     original = project.read_bytes()
-    monkeypatch.setattr(cli, "latest_version", dependency_module.latest_version)
+    monkeypatch.setattr(ReleaseClient, "_public", public_lookup)
 
     def open_url(url, timeout):
         if "private-package" in url:
             raise HTTPError(url, 404, "Not Found", Message(), None)
         return io.BytesIO(b'{"releases": {"0.27.3": [{"yanked": false}]}}')
 
-    monkeypatch.setattr(dependency_module, "urlopen", open_url)
+    monkeypatch.setattr(ReleaseClient, "_read", lambda self, request: (open_url(request.full_url, 15).read(), ""))
     result = runner.invoke(cli.app, flags)
     assert result.exit_code == 1
     for message in (
         "Package private-package was not found on public PyPI (HTTP 404)",
         "Check the package name",
         "private or unpublished",
-        "Private indexes are not supported",
+        "Use --index",
         "[tool.uv.sources]",
         "use -w",
         "No files were written",
@@ -212,17 +215,14 @@ def test_other_http_errors_are_not_reclassified(monkeypatch, code):
     def open_url(url, timeout):
         raise error
 
-    monkeypatch.setattr(dependency_module, "urlopen", open_url)
-    with pytest.raises(HTTPError) as caught:
+    monkeypatch.setattr(ReleaseClient, "_read", lambda self, request: (open_url(request.full_url, 15).read(), ""))
+    with pytest.raises(ValueError, match=f"HTTP {code}"):
         dependency_module.latest_version("example")
-    assert caught.value is error
 
 
 def test_no_stable_release(monkeypatch):
     monkeypatch.setattr(
-        dependency_module,
-        "urlopen",
-        lambda *_args, **_kwargs: io.BytesIO(b'{"releases": {"1.0rc1": [{"yanked": false}]}}'),
+        ReleaseClient, "_read", lambda self, request: (b'{"releases": {"1.0rc1": [{"yanked": false}]}}', "")
     )
     with pytest.raises(ValueError, match="No stable"):
         dependency_module.latest_version("example")

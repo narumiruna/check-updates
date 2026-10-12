@@ -5,6 +5,7 @@ from packaging.version import Version
 from typer.testing import CliRunner
 
 from check_updates import cli
+from check_updates.indexes import Release
 
 runner = CliRunner()
 
@@ -39,7 +40,7 @@ def workspace(tmp_path, monkeypatch):
         calls.append(name)
         return Version("2.0")
 
-    monkeypatch.setattr(cli, "latest_version", fetch)
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(fetch(name))])
     return root, member, excluded, unrelated, lock, calls
 
 
@@ -105,7 +106,7 @@ def test_workspace_lookup_failure_does_not_edit_any_project(workspace, monkeypat
             raise URLError("unavailable")
         return Version("2.0")
 
-    monkeypatch.setattr(cli, "latest_version", fetch)
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(fetch(name))])
     result = runner.invoke(cli.app, ["-u", "-w"])
     assert result.exit_code == 1
     assert "unavailable" in result.output
@@ -164,7 +165,7 @@ def test_virtual_root_and_recursive_member_globs(tmp_path, monkeypatch):
     member = tmp_path / "packages" / "nested" / "app" / "pyproject.toml"
     member.parent.mkdir(parents=True)
     member.write_text('[project]\nname = "app"\ndependencies = ["typer>=1.0"]\n')
-    monkeypatch.setattr(cli, "latest_version", lambda _name: Version("2.0"))
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(Version("2.0"))])
     result = runner.invoke(cli.app, ["-u", "-w"])
     assert result.exit_code == 0, result.output
     assert "typer>=2.0" in root.read_text()
@@ -174,7 +175,7 @@ def test_virtual_root_and_recursive_member_globs(tmp_path, monkeypatch):
 def test_member_source_overrides_root_source(workspace):
     _root, member, _excluded, _unrelated, _lock, calls = workspace
     with member.open("a") as stream:
-        stream.write('[tool.uv.sources]\nbird-feeder = { index = "pypi" }\n')
+        stream.write("[tool.uv.sources]\nbird-feeder = {}\n")
     result = runner.invoke(cli.app, ["-w"])
     assert result.exit_code == 0, result.output
     assert calls == ["typer", "bird-feeder", "pytest"]
