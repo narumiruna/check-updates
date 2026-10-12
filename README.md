@@ -114,7 +114,7 @@ exclude = ["packages/seeds"]
 - Root source definitions apply to members unless overridden by a member.
 - A missing workspace, a selected member without `pyproject.toml`, or a read or lookup failure stops the command with exit code `1`.
 
-Without `-w`, only the current directory's `pyproject.toml` is checked. Workspace discovery follows [uv workspace configuration](https://docs.astral.sh/uv/concepts/projects/workspaces/#getting-started). It does not run uv.
+Without `-w`, only the current directory's `pyproject.toml` is checked. Dependencies declared with `workspace = true` or an external workspace path in that file's `[tool.uv.sources]` are still skipped, with a reminder to use `-w` to check members. Parent workspace source definitions are only read with `-w`. Workspace discovery follows [uv workspace configuration](https://docs.astral.sh/uv/concepts/projects/workspaces/#getting-started). It does not run uv.
 
 ## Update scope and limitations
 
@@ -123,6 +123,8 @@ Without `-w`, only the current directory's `pyproject.toml` is checked. Workspac
 - Updates single `>=`, `==`, and `~=` version constraints. Adds `>=VERSION` to requirements without a version constraint. Does not lower existing versions.
 - Preserves extras, environment markers, comments, quotes, TOML formatting, and line endings. Checks marked dependencies regardless of the current environment.
 - Reports and skips URL dependencies, wildcard pins, multiple constraints, exclusions, upper bounds, and strict `>` bounds. Dependency-group include entries remain unchanged.
+
+Only public PyPI is queried; private index settings are not read. A PyPI 404 stops the check with a message naming the package and suggesting checks for misspellings, private or unpublished packages, and uv workspace configuration. A 404 alone does not identify a private package, so it is not silently skipped. No files are written when a lookup fails.
 
 The tool does not resolve dependencies or check Python-version compatibility. Check compatibility before installing updates.
 

@@ -1,5 +1,7 @@
 import io
 import json
+from email.message import Message
+from urllib.error import HTTPError
 from urllib.error import URLError
 
 import pytest
@@ -173,6 +175,47 @@ def test_pypi_uses_highest_stable_non_yanked_release(monkeypatch):
     monkeypatch.setattr(dependency_module, "urlopen", open_url)
     assert dependency_module.latest_version("Some_Package") == Version("1.5")
     assert calls == [("https://pypi.org/pypi/some-package/json", 15)]
+
+
+@pytest.mark.parametrize("flags", [[], ["-u"], ["--debug", "-u"]])
+def test_pypi_not_found_has_actionable_error_without_writes(project, monkeypatch, flags):
+    project.write_text('[project]\ndependencies = ["typer>=0.27.1", "private-package"]\n')
+    original = project.read_bytes()
+    monkeypatch.setattr(cli, "latest_version", dependency_module.latest_version)
+
+    def open_url(url, timeout):
+        if "private-package" in url:
+            raise HTTPError(url, 404, "Not Found", Message(), None)
+        return io.BytesIO(b'{"releases": {"0.27.3": [{"yanked": false}]}}')
+
+    monkeypatch.setattr(dependency_module, "urlopen", open_url)
+    result = runner.invoke(cli.app, flags)
+    assert result.exit_code == 1
+    for message in (
+        "Package private-package was not found on public PyPI (HTTP 404)",
+        "Check the package name",
+        "private or unpublished",
+        "Private indexes are not supported",
+        "[tool.uv.sources]",
+        "use -w",
+        "No files were written",
+    ):
+        assert message in result.stderr
+    assert ("Traceback" in result.stderr) is ("--debug" in flags)
+    assert project.read_bytes() == original
+
+
+@pytest.mark.parametrize("code", [401, 403, 429, 500])
+def test_other_http_errors_are_not_reclassified(monkeypatch, code):
+    error = HTTPError("https://pypi.org/pypi/example/json", code, "failure", Message(), None)
+
+    def open_url(url, timeout):
+        raise error
+
+    monkeypatch.setattr(dependency_module, "urlopen", open_url)
+    with pytest.raises(HTTPError) as caught:
+        dependency_module.latest_version("example")
+    assert caught.value is error
 
 
 def test_no_stable_release(monkeypatch):
