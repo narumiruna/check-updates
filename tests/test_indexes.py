@@ -5,6 +5,7 @@ import io
 import json
 from email.message import Message
 from http.client import HTTPMessage
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.error import URLError
 from urllib.request import Request
@@ -216,8 +217,6 @@ def test_public_cache_hit_expiry_corruption_and_bypass(tmp_path, monkeypatch):
 
 def test_cache_write_failure_is_nonfatal(monkeypatch):
     monkeypatch.setattr(ReleaseClient, "_read", lambda self, req: (b'{"releases": {"2": [{}]}}', "application/json"))
-    from pathlib import Path
-
     monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("denied")))
     assert ReleaseClient().get("demo") == [Release(Version("2"))]
 
@@ -570,4 +569,78 @@ def test_invalid_authenticate_configuration_does_not_send_requests(tmp_path, mon
     result = runner.invoke(cli.app, ["-u"])
     assert result.exit_code == 1, result.output
     assert "authenticate must be auto, always, or never" in result.stderr
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("setting", [None, "", "relative-cache", ".", "absolute"])
+def test_cache_location_uses_only_absolute_paths(tmp_path, monkeypatch, setting):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    if setting is None:
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    elif setting == "absolute":
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "configured-cache"))
+    else:
+        monkeypatch.setenv("XDG_CACHE_HOME", setting)
+    root = tmp_path / "configured-cache" if setting == "absolute" else home / ".cache"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    calls = []
+
+    def read(self, request):
+        calls.append(request.full_url)
+        return b'{"releases": {"2": [{}]}}', "application/json"
+
+    monkeypatch.setattr(ReleaseClient, "_read", read)
+    cache = indexes._cache_path("demo")
+    assert cache.is_absolute()
+    assert cache.parent == root / "check-updates"
+    assert ReleaseClient().get("demo") == [Release(Version("2"))]
+    assert cache.is_file()
+    assert list(project.iterdir()) == []
+    other = tmp_path / "other-project"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    assert indexes._cache_path("demo") == cache
+    assert ReleaseClient().get("demo") == [Release(Version("2"))]
+    assert calls == ["https://pypi.org/pypi/demo/json"]
+    assert list(other.iterdir()) == []
+
+
+@pytest.mark.parametrize("host", ["packages.example", "[::1]"])
+def test_index_port_zero_is_rejected(host):
+    with pytest.raises(ValueError, match="Index port must be between 1 and 65535"):
+        Index(f"https://user:secret@{host}:0/simple").request("demo")
+
+
+@pytest.mark.parametrize("port", [1, 443, 8443, 65535])
+def test_nonzero_index_ports_are_preserved(port):
+    request = Index(f"https://user:secret@packages.example:{port}/simple").request("demo")
+    assert request.full_url == f"https://packages.example:{port}/simple/demo/"
+    assert request.get_header("Authorization") == "Basic " + base64.b64encode(b"user:secret").decode()
+
+
+@pytest.mark.parametrize("credential_source", ["url", "environment"])
+def test_zero_port_does_not_send_credentials_or_write_files(tmp_path, monkeypatch, credential_source):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    secret = "zero-port-secret"
+    url = (
+        f"https://user:{secret}@packages.example:0/simple"
+        if credential_source == "url"
+        else "https://packages.example:0/simple"
+    )
+    path.write_text(
+        f'[project]\ndependencies = ["demo>=1"]\n[[tool.uv.index]]\nname = "private"\nurl = "{url}"\ndefault = true\n'
+    )
+    before = path.read_bytes()
+    if credential_source == "environment":
+        monkeypatch.setenv("UV_INDEX_PRIVATE_USERNAME", "user")
+        monkeypatch.setenv("UV_INDEX_PRIVATE_PASSWORD", secret)
+    monkeypatch.setattr(ReleaseClient, "_read", lambda *args: pytest.fail("Port zero must not send a request"))
+    result = runner.invoke(cli.app, ["-u", "--debug"])
+    assert result.exit_code == 1, result.output
+    assert "Invalid index URL" in result.stderr
+    assert secret not in result.output
     assert path.read_bytes() == before

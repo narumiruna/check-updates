@@ -203,7 +203,7 @@ Index sources with `extra = "cpu"` apply only to occurrences in `[project.option
 
 For named indexes, supply HTTP Basic credentials using `UV_INDEX_INTERNAL_USERNAME` and `UV_INDEX_INTERNAL_PASSWORD` (uppercase the index name and replace every non-alphanumeric character with an underscore). Alternatively, credentials can be URL-encoded in the URL userinfo; environment credentials override URL credentials. Prefer the named-index environment method so secrets do not appear in shell history or process arguments. The `authenticate` setting accepts `auto` (the default), `always`, or `never`. `auto` uses URL or named environment credentials when present. `always` requires these credentials before a request. `never` rejects URL or named environment credentials before a request and otherwise sends no `Authorization` header. Unknown values are errors. These rules also apply to named sources. No credential providers are used.
 
-Authenticated requests require HTTPS. URLs with queries or fragments are rejected. Cross-origin redirects and HTTPS downgrades are rejected; same-origin redirects retain authentication.
+Authenticated requests require HTTPS. Explicit ports must be between `1` and `65535`; port `0` is rejected before a request. URLs with queries or fragments are rejected. Cross-origin redirects and HTTPS downgrades are rejected; same-origin redirects retain authentication.
 
 Index errors and debug tracebacks do not expose credentials or private response bodies. Output links omit URL userinfo. Paths and package names can still be sensitive. Private-index metadata is kept only in memory for the invocation and is never written to disk.
 
@@ -211,7 +211,7 @@ A public PyPI 404 stops the check with a message naming the package and suggesti
 
 ### Cache and retries
 
-Public PyPI release metadata is cached for one hour under `$XDG_CACHE_HOME/check-updates`, or `~/.cache/check-updates` when that variable is unset. The cache stores versions, Python constraints, and a safe public release-note link; it does not store credentials or response bodies. Corrupt or expired entries are fetched again. Cache-write failures do not fail the check. Use `--no-cache` for fresh lookups without persistent reads or writes. Per-invocation metadata sharing still applies.
+Public PyPI release metadata is cached for one hour under `$XDG_CACHE_HOME/check-updates`, or `~/.cache/check-updates` when that variable is unset, empty, or not an absolute path. The cache stores versions, Python constraints, and a safe public release-note link; it does not store credentials or response bodies. Corrupt or expired entries are fetched again. Cache-write failures do not fail the check. Use `--no-cache` for fresh lookups without persistent reads or writes. Per-invocation metadata sharing still applies.
 
 Metadata requests use a 15-second timeout and up to three attempts. Network connection failures and HTTP `408`, `429`, `500`, `502`, `503`, and `504` are retried after 0.25 and 0.5 seconds. Other HTTP errors are not retried. No dependency files are written until all lookups succeed.
 

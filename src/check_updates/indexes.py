@@ -77,6 +77,10 @@ class Index:
         if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.query or parsed.fragment:
             msg = "Index must be an HTTP(S) URL without a query or fragment."
             raise ValueError(msg)
+        port = parsed.port
+        if port == 0:
+            msg = "Index port must be between 1 and 65535."
+            raise ValueError(msg)
         username, password = self._credentials(parsed)
         if (username or password) and parsed.scheme != "https":
             msg = "Authenticated indexes require HTTPS."
@@ -84,8 +88,8 @@ class Index:
         host = parsed.hostname
         if ":" in host:
             host = f"[{host}]"
-        if parsed.port:
-            host += f":{parsed.port}"
+        if port is not None:
+            host += f":{port}"
         clean = urlunsplit((parsed.scheme, host, parsed.path.rstrip("/") + "/", "", ""))
         request = Request(urljoin(clean, canonicalize_name(package) + "/"))
         request.add_header("Accept", "application/vnd.pypi.simple.v1+json, text/html;q=0.9")
@@ -183,7 +187,9 @@ def _release_notes(urls: dict | None) -> str | None:
 
 
 def _cache_path(name: str) -> Path:
-    root = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    if not root.is_absolute():
+        root = Path.home() / ".cache"
     digest = hashlib.sha256(canonicalize_name(name).encode()).hexdigest()
     return root / "check-updates" / f"v1-{digest}.json"
 
