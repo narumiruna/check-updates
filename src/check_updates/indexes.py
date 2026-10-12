@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import IO
 from urllib.error import HTTPError
 from urllib.error import URLError
+from urllib.parse import SplitResult
 from urllib.parse import unquote
 from urllib.parse import urljoin
 from urllib.parse import urlsplit
@@ -45,6 +47,27 @@ class Index:
     name: str | None = None
     explicit: bool = False
     default: bool = False
+    authenticate: str = "auto"
+
+    def _credentials(self, parsed: SplitResult) -> tuple[str, str]:
+        if self.authenticate not in {"auto", "always", "never"}:
+            msg = "Index authenticate must be auto, always, or never."
+            raise ValueError(msg)
+        username = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        if self.name:
+            prefix = "UV_INDEX_" + re.sub(r"[^A-Z0-9]", "_", self.name.upper())
+            username = os.environ.get(prefix + "_USERNAME", username)
+            password = os.environ.get(prefix + "_PASSWORD", password)
+        if self.authenticate == "never" and (
+            parsed.username is not None or parsed.password is not None or username or password
+        ):
+            msg = "Index authenticate=never does not permit URL or environment credentials."
+            raise ValueError(msg)
+        if self.authenticate == "always" and not (username or password):
+            msg = "Index authenticate=always requires URL or environment credentials."
+            raise ValueError(msg)
+        return username, password
 
     def request(self, package: str) -> Request:
         if not isinstance(self.url, str) or any(not c.isprintable() or c.isspace() for c in self.url):
@@ -54,12 +77,7 @@ class Index:
         if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.query or parsed.fragment:
             msg = "Index must be an HTTP(S) URL without a query or fragment."
             raise ValueError(msg)
-        username = unquote(parsed.username or "")
-        password = unquote(parsed.password or "")
-        if self.name:
-            prefix = "UV_INDEX_" + self.name.upper().replace("-", "_")
-            username = os.environ.get(prefix + "_USERNAME", username)
-            password = os.environ.get(prefix + "_PASSWORD", password)
+        username, password = self._credentials(parsed)
         if (username or password) and parsed.scheme != "https":
             msg = "Authenticated indexes require HTTPS."
             raise ValueError(msg)
@@ -281,10 +299,12 @@ class ReleaseClient:
     def _private(self, name: str, indexes: tuple[Index, ...]) -> tuple[list[Release] | None, str | None]:
         releases = None
         for index in indexes:
+            if index.explicit:
+                continue  # Retain explicit default entries only to block the public fallback.
             try:
                 request = index.request(name)
             except ValueError:
-                msg = "Invalid index URL or insecure authentication configuration."
+                msg = "Invalid index URL or authentication policy. Check authenticate and index credentials."
                 raise ValueError(msg) from None
             try:
                 body, content_type = self._read(request)

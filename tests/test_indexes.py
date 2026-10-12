@@ -418,3 +418,156 @@ def test_private_failure_after_success_does_not_write(tmp_path, monkeypatch):
 )
 def test_untrusted_project_release_links_are_not_displayed(url):
     assert indexes._release_notes({"Changelog": url}) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [
+        ("internal.proxy", "INTERNAL_PROXY"),
+        ("internal-proxy", "INTERNAL_PROXY"),
+        ("internal.proxy-cache_2", "INTERNAL_PROXY_CACHE_2"),
+    ],
+)
+def test_credential_keys_replace_all_non_alphanumeric_characters(monkeypatch, name, key):
+    monkeypatch.setenv(f"UV_INDEX_{key}_USERNAME", "user")
+    monkeypatch.setenv(f"UV_INDEX_{key}_PASSWORD", "secret")
+    request = Index("https://example.org/simple", name).request("demo")
+    assert request.get_header("Authorization") == "Basic " + base64.b64encode(b"user:secret").decode()
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        ("demo", "demo>=1.9"),
+        ("demo>=1", "demo>=1.9"),
+        ("demo~=1.0", "demo~=1.9"),
+        ("demo>=1,<3", "demo>=1.9,<3"),
+        ("demo==1", "demo==2.0+internal"),
+    ],
+)
+@pytest.mark.parametrize("distribution", ["tar.gz", "whl"])
+def test_private_local_builds_do_not_write_invalid_requirements(
+    tmp_path, monkeypatch, original, expected, distribution
+):
+    import tomlkit
+    from packaging.requirements import Requirement
+
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    path.write_text("[project]\ndependencies = [" + json.dumps(original) + "]\n")
+    suffix = "-py3-none-any.whl" if distribution == "whl" else ".tar.gz"
+    body = json.dumps(
+        {"files": [{"filename": f"demo-{version}{suffix}"} for version in ("1.9", "2.0+internal")]}
+    ).encode()
+    monkeypatch.setattr(ReleaseClient, "_read", lambda self, req: (body, "application/json"))
+    result = runner.invoke(cli.app, ["--index", "https://example.org/simple", "-u"])
+    assert result.exit_code == 0, result.output
+    written = tomlkit.parse(path.read_text())["project"]["dependencies"][0]
+    assert written == expected
+    assert Requirement(written).name == "demo"
+
+
+@pytest.mark.parametrize("with_other", [False, True])
+def test_explicit_default_blocks_public_even_when_no_index_is_eligible(tmp_path, monkeypatch, with_other):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    content = (
+        '[project]\ndependencies = ["demo>=1"]\n[[tool.uv.index]]\nname = "private"\n'
+        'url = "https://private.example/simple"\nexplicit = true\ndefault = true\n'
+    )
+    if with_other:
+        content += '[[tool.uv.index]]\nname = "other"\nurl = "https://other.example/simple"\n'
+    path.write_text(content)
+    before = path.read_bytes()
+    seen = []
+
+    def read(self, req):
+        seen.append(req.full_url)
+        assert req.full_url == "https://other.example/simple/demo/"
+        raise http_error(404, req.full_url)
+
+    monkeypatch.setattr(ReleaseClient, "_read", read)
+    monkeypatch.setattr(ReleaseClient, "_public", lambda *args: pytest.fail("Public PyPI must remain disabled"))
+    result = runner.invoke(cli.app, ["-u", "--debug"])
+    assert result.exit_code == 1, result.output
+    assert "not found on configured indexes" in result.stderr
+    assert seen == (["https://other.example/simple/demo/"] if with_other else [])
+    assert path.read_bytes() == before
+    assert not (tmp_path / "cache").exists()
+
+
+def test_explicit_default_named_source_can_still_use_its_index(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[project]\ndependencies = ["demo>=1"]\n[[tool.uv.index]]\nname = "private"\n'
+        'url = "https://private.example/simple"\nexplicit = true\ndefault = true\n'
+        '[tool.uv.sources]\ndemo = {index = "private"}\n'
+    )
+    seen = []
+
+    def read(self, req):
+        seen.append(req.full_url)
+        return b'{"files": [{"filename": "demo-2.tar.gz"}]}', "application/json"
+
+    monkeypatch.setattr(ReleaseClient, "_read", read)
+    result = runner.invoke(cli.app, ["--format", "json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["updates"][0]["version"] == "2"
+    assert seen == ["https://private.example/simple/demo/"]
+
+
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("credential_source", ["url", "environment"])
+def test_authenticate_never_rejects_credentials_before_network(tmp_path, monkeypatch, named, credential_source):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    secret = "must-not-leak"
+    url = f"https://user:{secret}@example.org/simple" if credential_source == "url" else "https://example.org/simple"
+    content = (
+        '[project]\ndependencies = ["demo>=1"]\n[[tool.uv.index]]\nname = "private"\n'
+        f'url = "{url}"\nauthenticate = "never"\n'
+    )
+    if named:
+        content += 'explicit = true\n[tool.uv.sources]\ndemo = {index = "private"}\n'
+    path.write_text(content)
+    before = path.read_bytes()
+    if credential_source == "environment":
+        monkeypatch.setenv("UV_INDEX_PRIVATE_USERNAME", "user")
+        monkeypatch.setenv("UV_INDEX_PRIVATE_PASSWORD", secret)
+    monkeypatch.setattr(ReleaseClient, "_read", lambda *args: pytest.fail("Policy errors must not send requests"))
+    result = runner.invoke(cli.app, ["-u", "--debug"])
+    assert result.exit_code == 1, result.output
+    assert "authentication policy" in result.stderr
+    assert secret not in result.output
+    assert path.read_bytes() == before
+
+
+def test_authenticate_never_allows_only_anonymous_requests():
+    request = Index("https://example.org/simple", authenticate="never").request("demo")
+    assert not request.has_header("Authorization")
+
+
+def test_authenticate_always_requires_direct_credentials(monkeypatch):
+    with pytest.raises(ValueError, match="requires URL or environment credentials"):
+        Index("https://example.org/simple", "required", authenticate="always").request("demo")
+    monkeypatch.setenv("UV_INDEX_REQUIRED_USERNAME", "user")
+    monkeypatch.setenv("UV_INDEX_REQUIRED_PASSWORD", "secret")
+    request = Index("https://example.org/simple", "required", authenticate="always").request("demo")
+    assert request.get_header("Authorization") == "Basic " + base64.b64encode(b"user:secret").decode()
+
+
+@pytest.mark.parametrize("policy", ['"sometimes"', '["never"]', "false"])
+def test_invalid_authenticate_configuration_does_not_send_requests(tmp_path, monkeypatch, policy):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[project]\ndependencies = ["demo>=1"]\n[[tool.uv.index]]\n'
+        'url = "https://example.org/simple"\n' + f"authenticate = {policy}\n"
+    )
+    before = path.read_bytes()
+    monkeypatch.setattr(ReleaseClient, "_read", lambda *args: pytest.fail("Invalid policies must not send requests"))
+    result = runner.invoke(cli.app, ["-u"])
+    assert result.exit_code == 1, result.output
+    assert "authenticate must be auto, always, or never" in result.stderr
+    assert path.read_bytes() == before

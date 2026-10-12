@@ -62,7 +62,8 @@ def choose_version(
     candidates = []
     for release in releases:
         version = release.version
-        if before is not None and version <= before:
+        # The target must be newer and valid for the output operator.
+        if (before is not None and version <= before) or (version.local and (spec is None or spec.operator != "==")):
             continue
         if version not in limits:
             continue

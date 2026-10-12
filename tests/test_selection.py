@@ -100,3 +100,26 @@ def test_python_floor(value, expected):
 def test_python_floor_never_guesses(value):
     with pytest.raises(ValueError):
         python_baseline(value)
+
+
+@pytest.mark.parametrize("original", ["demo", "demo>=1.2.3", "demo~=1.2.3", "demo>=1.2.3,<2"])
+def test_local_versions_cannot_enter_ordered_requirements(original):
+    req = Requirement(original)
+    found = choose_version(req, releases("1.2.4", "1.2.5+internal"), "latest", None)
+    assert found == Version("1.2.4")
+    assert found is not None
+    updated = replacement(req, original, found)
+    assert updated is not None
+    assert Requirement(updated).name == "demo"
+    assert choose_version(req, releases("1.2.5+internal"), "latest", None) is None
+
+
+@pytest.mark.parametrize("target", ["patch", "minor", "latest"])
+def test_local_exact_pins_remain_valid_for_all_targets(target):
+    original = "demo==1.2.3+old"
+    found = choose_version(Requirement(original), releases("1.2.4", "1.2.5+internal"), target, None)
+    assert found == Version("1.2.5+internal")
+    assert found is not None
+    updated = replacement(Requirement(original), original, found)
+    assert updated == "demo==1.2.5+internal"
+    assert Requirement(updated).specifier.contains(found)

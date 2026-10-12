@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 import tomlkit
@@ -110,7 +111,13 @@ def _configured_indexes(config: Mapping) -> list[Index]:
         if any(not isinstance(item.get(flag, False), bool) for flag in ("explicit", "default")):
             msg = "Index explicit and default values must be booleans."
             raise TypeError(msg)
-        index = Index(item["url"], item.get("name"), item.get("explicit", False), item.get("default", False))
+        authenticate = item.get("authenticate", "auto")
+        if authenticate not in ("auto", "always", "never"):
+            msg = "Index authenticate must be auto, always, or never."
+            raise ValueError(msg)
+        index = Index(
+            item["url"], item.get("name"), item.get("explicit", False), item.get("default", False), authenticate
+        )
         result.append(index)
     return result
 
@@ -150,8 +157,8 @@ def package_indexes(root: Project, project: Project, name: str, urls: list[str])
             msg = f"Undefined named index for {name}."
             raise ValueError(msg)
         index = definitions[index_name]
-        return (Index(index.url, index.name, default=True),)
-    return tuple(sorted((i for i in definitions.values() if not i.explicit), key=lambda i: i.default))
+        return (replace(index, explicit=False, default=True),)
+    return tuple(sorted((i for i in definitions.values() if not i.explicit or i.default), key=lambda i: i.default))
 
 
 def workspace_dependencies(root: Project, project: Project) -> set[str]:
