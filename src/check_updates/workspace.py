@@ -133,7 +133,30 @@ def _sources(root: Project, project: Project) -> dict:
     return sources
 
 
-def package_indexes(root: Project, project: Project, name: str, urls: list[str]) -> tuple[Index, ...]:
+def _index_sources(source: object, section: tuple[str, ...]) -> list[Mapping]:
+    entries = source if isinstance(source, list) else [source]
+    extra = (
+        canonicalize_name(section[2])
+        if len(section) == 3 and section[:2] == ("project", "optional-dependencies")
+        else None
+    )
+    matched = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or "index" not in entry:
+            continue
+        if "extra" in entry:
+            if not isinstance(entry["extra"], str):
+                msg = "Index source extra must be a string."
+                raise TypeError(msg)
+            if extra is None or canonicalize_name(entry["extra"]) != extra:
+                continue
+        matched.append(entry)
+    return matched
+
+
+def package_indexes(
+    root: Project, project: Project, name: str, urls: list[str], *, section: tuple[str, ...] = ()
+) -> tuple[Index, ...]:
     """Member definitions override root names; named sources never fall back to PyPI."""
     if urls:
         return tuple(Index(url, default=True) for url in urls)
@@ -142,14 +165,13 @@ def package_indexes(root: Project, project: Project, name: str, urls: list[str])
         for index in _configured_indexes(config):
             definitions[index.name or index.url] = index
     sources = _sources(root, project)
-    source = sources.get(name, {})
-    entries = source if isinstance(source, list) else [source]
-    names = {entry["index"] for entry in entries if isinstance(entry, Mapping) and "index" in entry}
-    if any("marker" in entry for entry in entries if isinstance(entry, Mapping) and "index" in entry):
+    entries = _index_sources(sources.get(name, {}), section)
+    names = {entry["index"] for entry in entries}
+    if any("marker" in entry for entry in entries):
         msg = f"Marker-specific index routing for {name} is not supported."
         raise ValueError(msg)
     if len(names) > 1:
-        msg = f"Multiple marker-specific indexes for {name} are not supported."
+        msg = f"Multiple indexes for one dependency occurrence of {name} are not supported."
         raise ValueError(msg)
     if names:
         index_name = next(iter(names))

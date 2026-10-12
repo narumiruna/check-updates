@@ -68,7 +68,7 @@ def _check_project(
             hint = " Use -w to also check workspace members." if name in local_names and not workspace else ""
             typer.echo(f"{prefix}Skipped {dependency.requirement}: {reason}.{hint}", err=True)
             continue
-        indexes = package_indexes(root, project, name, urls)
+        indexes = package_indexes(root, project, name, urls, section=dependency.section)
         releases = client.get(name, indexes)
         if not releases:
             msg = f"No stable, non-yanked release found for {name}."
