@@ -177,3 +177,19 @@ def test_cli_index_override_still_applies_to_extra_occurrences(project):
     assert json.loads(result.stdout)["updates"][0]["version"] == "3"
     assert calls == ["https://gpu.example/simple/demo/"]
     assert path.read_bytes() == original
+
+
+def test_normalized_extra_selector_keeps_qualified_index_routing(project):
+    path, calls = project
+    path.write_text(
+        path.read_text()
+        .replace('cpu = ["demo>=1"]', 'cpu-tools = ["demo>=1"]')
+        .replace('extra = "cpu"', 'extra = "CPU_tools"')
+    )
+    result = runner.invoke(cli.app, ["--extra", "CPU.Tools", "--format", "json"])
+    assert result.exit_code == 0, result.output
+    updates = json.loads(result.stdout)["updates"]
+    assert len(updates) == 1
+    assert updates[0]["version"] == "2"
+    assert updates[0]["section"] == ["project", "optional-dependencies", "cpu-tools"]
+    assert calls == ["https://cpu.example/simple/demo/"]

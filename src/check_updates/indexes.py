@@ -9,6 +9,7 @@ import re
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from http.client import HTTPException
 from http.client import HTTPMessage
 from pathlib import Path
 from typing import IO
@@ -255,7 +256,7 @@ class ReleaseClient:
             except HTTPError as error:
                 if error.code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
                     raise
-            except (URLError, TimeoutError, ConnectionError):
+            except (URLError, TimeoutError, ConnectionError, HTTPException):
                 if attempt == 2:
                     raise
             logger.debug("Retrying metadata request (attempt %d of 3)", attempt + 2)
@@ -284,6 +285,9 @@ class ReleaseClient:
                 if error.code == 404
                 else f"PyPI lookup failed for {name} (HTTP {error.code})."
             )
+            raise ValueError(msg) from None
+        except HTTPException:
+            msg = f"PyPI response could not be read for {name}. No files were written."
             raise ValueError(msg) from None
         releases, note = _public_releases(json.loads(body), name)
         if note:
@@ -319,7 +323,7 @@ class ReleaseClient:
                     continue
                 msg = f"Index lookup failed for {name} (HTTP {error.code})."
                 raise ValueError(msg) from None
-            except (OSError, URLError, ValueError):
+            except (OSError, URLError, ValueError, HTTPException):
                 # Do not expose private response URLs, bodies, or credentials, even in debug tracebacks.
                 msg = f"Index lookup failed for {name}. Check connectivity and index credentials."
                 raise ValueError(msg) from None

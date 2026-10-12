@@ -199,3 +199,39 @@ def test_excluded_all_candidates_does_not_change_composite(catalog):
     result = runner.invoke(cli.app, ["-u"])
     assert result.exit_code == 0, result.output
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("declared", "selector"),
+    [
+        ("qa-tools", "qa_tools"),
+        ("qa_tools", "QA.Tools"),
+        ("QA.Tools", "qa-tools"),
+        ("qa-tools", "QA.._-TOOLS"),
+    ],
+)
+@pytest.mark.parametrize("option", ["--group", "--extra"])
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_section_filters_normalize_both_names_and_preserve_original_sections(
+    catalog, declared, selector, option, upgrade
+):
+    path, calls = catalog
+    extra_block = f'[project.optional-dependencies]\n"{declared}" = ["demo-pkg>=1.2.3"]\n'
+    group_block = f'[dependency-groups]\n"{declared}" = ["demo-pkg>=1.2.3"]\n'
+    path.write_text('[project]\ndependencies = ["untouched>=1"]\n' + extra_block + group_block)
+    original = path.read_bytes()
+    flags = [option, selector, "-u"] if upgrade else [option, selector, "--format", "json"]
+    result = runner.invoke(cli.app, flags)
+    assert result.exit_code == 0, result.output
+    assert calls == ["demo-pkg"]
+    if upgrade:
+        block = group_block if option == "--group" else extra_block
+        assert path.read_bytes() == original.replace(block.encode(), block.replace("1.2.3", "2").encode())
+    else:
+        updates = json.loads(result.stdout)["updates"]
+        assert len(updates) == 1
+        section = (
+            ["dependency-groups", declared] if option == "--group" else ["project", "optional-dependencies", declared]
+        )
+        assert updates[0]["section"] == section
+        assert path.read_bytes() == original

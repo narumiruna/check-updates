@@ -4,10 +4,13 @@ import base64
 import io
 import json
 from email.message import Message
+from http.client import BadStatusLine
 from http.client import HTTPMessage
+from http.client import IncompleteRead
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.error import URLError
+from urllib.request import OpenerDirector
 from urllib.request import Request
 
 import pytest
@@ -644,3 +647,62 @@ def test_zero_port_does_not_send_credentials_or_write_files(tmp_path, monkeypatc
     assert "Invalid index URL" in result.stderr
     assert secret not in result.output
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("error", [IncompleteRead(b"partial body", 10), BadStatusLine("bad status")])
+def test_protocol_read_failures_retry_then_succeed(monkeypatch, error):
+    class BrokenResponse(Response):
+        def read(self, *args, **kwargs):
+            raise error
+
+    client = ReleaseClient()
+    attempts = []
+    delays = []
+    monkeypatch.setattr(indexes.time, "sleep", delays.append)
+
+    def open_request(request, timeout):
+        attempts.append(timeout)
+        return BrokenResponse() if len(attempts) < 3 else Response(b"done")
+
+    monkeypatch.setattr(client.opener, "open", open_request)
+    assert client._read(Request("https://example.org/")) == (b"done", "")
+    assert attempts == [15, 15, 15]
+    assert delays == [0.25, 0.5]
+
+
+@pytest.mark.parametrize("error", [IncompleteRead(b"response-secret", 10), BadStatusLine("response-secret")])
+@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize("debug", [False, True])
+def test_protocol_retry_exhaustion_is_safe_in_cli(tmp_path, monkeypatch, error, private, debug):
+    class BrokenResponse(Response):
+        def read(self, *args, **kwargs):
+            raise error
+
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\ndependencies = ["demo>=1"]\n')
+    original = path.read_bytes()
+    attempts = []
+    delays = []
+
+    def open_request(self, request, timeout):
+        attempts.append(request.full_url)
+        return BrokenResponse()
+
+    monkeypatch.setattr(OpenerDirector, "open", open_request)
+    monkeypatch.setattr(indexes.time, "sleep", delays.append)
+    flags = ["-u", "--no-cache"]
+    if private:
+        flags += ["--index", "https://user:credential-secret@example.org/simple"]
+    if debug:
+        flags += ["--debug"]
+    result = runner.invoke(cli.app, flags)
+    assert result.exit_code == 1, result.output
+    assert "Error:" in result.stderr
+    assert len(attempts) == 3
+    assert delays == [0.25, 0.5]
+    assert ("Traceback" in result.stderr) is debug
+    assert "response-secret" not in result.output
+    assert "credential-secret" not in result.output
+    assert path.read_bytes() == original
+    assert not (tmp_path / "cache").exists()

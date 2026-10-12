@@ -23,6 +23,10 @@ class Selection:
     extras: set[str] = field(default_factory=set)
     runtime: bool = False
 
+    def __post_init__(self) -> None:
+        self.groups = {canonicalize_name(name) for name in self.groups}
+        self.extras = {canonicalize_name(name) for name in self.extras}
+
     def accepts(self, dependency: Dependency, requirement: Requirement) -> bool:
         name = canonicalize_name(requirement.name)
         if name in self.exclude or (self.include and name not in self.include):
@@ -30,10 +34,11 @@ class Selection:
         if not (self.groups or self.extras or self.runtime):
             return True
         section = dependency.section
+        section_name = canonicalize_name(section[-1])
         return (
             (self.runtime and section == ("project", "dependencies"))
-            or (section[0] == "dependency-groups" and section[-1] in self.groups)
-            or (section[:2] == ("project", "optional-dependencies") and section[-1] in self.extras)
+            or (section[0] == "dependency-groups" and section_name in self.groups)
+            or (section[:2] == ("project", "optional-dependencies") and section_name in self.extras)
         )
 
 

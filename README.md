@@ -57,7 +57,7 @@ uvx check-updates -u --group dev --exclude pytest
 uvx check-updates --runtime --extra test --diff
 ```
 
-Package matching uses exact normalized names: case, hyphens, underscores, and dots are equivalent. There are no glob patterns. Exclusions take precedence over inclusions. Without section options, every supported section is checked. Section options select their union; package filters further restrict that union. Group includes are left unchanged and are not expanded. A nonexistent group, extra, or package filter selects nothing.
+Package, group, and extra matching uses exact normalized names: case, hyphens, underscores, and dots are equivalent. Original section names stay unchanged in output and TOML. There are no glob patterns. Exclusions take precedence over inclusions. Without section options, every supported section is checked. Section options select their union; package filters further restrict that union. Group includes are left unchanged and are not expanded. A nonexistent group, extra, or package filter selects nothing.
 
 `patch` keeps the baseline's major and minor components; `minor` keeps its major component. Both exclude epoch changes. `latest` allows any newer stable version admitted by preserved upper bounds and exclusions. The baseline is the requirement's version, not an installed or locked version. Requirements without a baseline are skipped in patch/minor mode. These labels follow numeric release components, including for packages below version 1.0, and do not guarantee compatibility.
 
@@ -213,7 +213,7 @@ A public PyPI 404 stops the check with a message naming the package and suggesti
 
 Public PyPI release metadata is cached for one hour under `$XDG_CACHE_HOME/check-updates`, or `~/.cache/check-updates` when that variable is unset, empty, or not an absolute path. The cache stores versions, Python constraints, and a safe public release-note link; it does not store credentials or response bodies. Corrupt or expired entries are fetched again. Cache-write failures do not fail the check. Use `--no-cache` for fresh lookups without persistent reads or writes. Per-invocation metadata sharing still applies.
 
-Metadata requests use a 15-second timeout and up to three attempts. Network connection failures and HTTP `408`, `429`, `500`, `502`, `503`, and `504` are retried after 0.25 and 0.5 seconds. Other HTTP errors are not retried. No dependency files are written until all lookups succeed.
+Metadata requests use a 15-second timeout and up to three attempts. Network connection failures, truncated responses, HTTP protocol errors, and HTTP `408`, `429`, `500`, `502`, `503`, and `504` are retried after 0.25 and 0.5 seconds. Failed response reads return a normal error after the last attempt. Error output does not include response data. Other HTTP errors are not retried. No dependency files are written until all lookups succeed.
 
 All file reads and index lookups finish before writing, so lookup failures do not cause partial updates. Multi-file writes are sequential, not transactional: if a write fails, earlier successful updates remain. Use the output and version control to review or restore changes.
 
