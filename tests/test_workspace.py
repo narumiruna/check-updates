@@ -91,8 +91,9 @@ def test_without_workspace_flag_updates_only_current_project(workspace):
     assert result.exit_code == 0, result.output
     assert "typer>=2.0" in root.read_text()
     assert member.read_bytes() == original
-    # Without -w, uv configuration remains outside the command's scope.
-    assert calls == ["bird-feeder", "typer"]
+    assert "Skipped bird-feeder: workspace dependency." in result.stderr
+    assert "Use -w to also check workspace members." in result.stderr
+    assert calls == ["typer"]
 
 
 def test_workspace_lookup_failure_does_not_edit_any_project(workspace, monkeypatch):

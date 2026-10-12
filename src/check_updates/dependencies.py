@@ -5,6 +5,7 @@ import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import urlopen
 
@@ -73,8 +74,20 @@ def latest_version(name: str) -> Version:
     """Return the highest stable release with at least one non-yanked file."""
     url = f"https://pypi.org/pypi/{quote(canonicalize_name(name), safe='')}/json"
     logger.debug("Requesting %s (timeout: 15s)", url)
-    with urlopen(url, timeout=15) as response:
-        data = json.load(response)
+    try:
+        with urlopen(url, timeout=15) as response:
+            data = json.load(response)
+    except HTTPError as error:
+        if error.code != 404:
+            raise
+        msg = (
+            f"Package {name} was not found on public PyPI (HTTP 404). "
+            "Check the package name; it may be private or unpublished. "
+            "Private indexes are not supported. "
+            "For uv workspace dependencies, declare workspace = true in [tool.uv.sources] "
+            "and use -w to include workspace root sources and check members. No files were written."
+        )
+        raise ValueError(msg) from error
     logger.debug("Received %d release entries for %s", len(data["releases"]), name)
     versions = []
     invalid = unstable = unavailable = 0

@@ -46,7 +46,8 @@ def _check_project(
         if reason:
             logger.debug("Skipping %s: %s", name, reason)
             prefix = f"{project.path}: " if workspace else ""
-            typer.echo(f"{prefix}Skipped {dependency.requirement}: {reason}.", err=True)
+            hint = " Use -w to also check workspace members." if name in local_names and not workspace else ""
+            typer.echo(f"{prefix}Skipped {dependency.requirement}: {reason}.{hint}", err=True)
             continue
         if name not in cache:
             logger.debug("PyPI cache miss for %s; fetching latest stable release", name)
@@ -71,7 +72,7 @@ def _collect_updates(workspace: bool) -> list[tuple[Project, list[Update]]]:
     pending = []
     cache: dict[str, Version] = {}
     for project in projects:
-        local_names = workspace_dependencies(projects[0], project) if workspace else set()
+        local_names = workspace_dependencies(projects[0], project)
         updates = _check_project(project, local_names, cache, workspace=workspace)
         if updates:
             pending.append((project, updates))
