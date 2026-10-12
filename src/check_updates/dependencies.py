@@ -1,24 +1,18 @@
 """Read dependencies and find stable PyPI updates without resolving a project."""
 
-import json
-import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
-from urllib.error import HTTPError
-from urllib.parse import quote
-from urllib.request import urlopen
 
 import tomlkit
 from packaging.requirements import Requirement
-from packaging.utils import canonicalize_name
-from packaging.version import InvalidVersion
+from packaging.specifiers import Specifier
 from packaging.version import Version
 from tomlkit.items import Array
 from tomlkit.items import String
 from tomlkit.toml_document import TOMLDocument
 
-logger = logging.getLogger(__name__)
+from check_updates.indexes import ReleaseClient
 
 
 @dataclass
@@ -34,14 +28,16 @@ class Update:
     dependency: Dependency
     replacement: str
     version: Version
+    release_link: str | None = None
+    project_link: str | None = None
 
 
 def version_change(update: Update) -> str:
     """Describe the requirement baseline, not compatibility or an installed version."""
-    specs = list(Requirement(update.dependency.requirement).specifier)
-    if not specs:
+    spec = baseline(Requirement(update.dependency.requirement))
+    if spec is None:
         return "unbounded"
-    before = Version(specs[0].version)
+    before = Version(spec.version)
     after = update.version
     if before.epoch != after.epoch or any(
         version.is_prerelease or version.is_postrelease or version.local or len(version.release) > 3
@@ -71,65 +67,27 @@ def dependencies(document: TOMLDocument) -> Iterator[Dependency]:
 
 
 def latest_version(name: str) -> Version:
-    """Return the highest stable release with at least one non-yanked file."""
-    url = f"https://pypi.org/pypi/{quote(canonicalize_name(name), safe='')}/json"
-    logger.debug("Requesting %s (timeout: 15s)", url)
-    try:
-        with urlopen(url, timeout=15) as response:
-            data = json.load(response)
-    except HTTPError as error:
-        if error.code != 404:
-            raise
-        msg = (
-            f"Package {name} was not found on public PyPI (HTTP 404). "
-            "Check the package name; it may be private or unpublished. "
-            "Private indexes are not supported. "
-            "For uv workspace dependencies, declare workspace = true in [tool.uv.sources] "
-            "and use -w to include workspace root sources and check members. No files were written."
-        )
-        raise ValueError(msg) from error
-    logger.debug("Received %d release entries for %s", len(data["releases"]), name)
-    versions = []
-    invalid = unstable = unavailable = 0
-    for value, files in data["releases"].items():
-        try:
-            version = Version(value)
-        except InvalidVersion:
-            invalid += 1
-            continue
-        if version.is_prerelease or version.is_devrelease:
-            unstable += 1
-            continue
-        if any(not file.get("yanked", False) for file in files):
-            versions.append(version)
-        else:
-            unavailable += 1
-    logger.debug(
-        "Release filtering for %s: %d eligible, %d invalid, %d prerelease/dev, %d empty or fully yanked",
-        name,
-        len(versions),
-        invalid,
-        unstable,
-        unavailable,
-    )
-    if not versions:
+    """Return the latest stable version without a persistent cache."""
+    releases = ReleaseClient(no_cache=True).get(name)
+    if not releases:
         msg = f"No stable, non-yanked release found for {name}."
         raise ValueError(msg)
-    latest = max(versions)
-    logger.debug("Selected latest stable release for %s: %s", name, latest)
-    return latest
+    return max(release.version for release in releases)
+
+
+def baseline(requirement: Requirement) -> Specifier | None:
+    return next((spec for spec in requirement.specifier if spec.operator in {">=", "==", "~="}), None)
 
 
 def replacement(requirement: Requirement, original: str, latest: Version) -> str | None:
-    """Replace a single lower bound or exact pin, or add a bare-name lower bound."""
-    specs = list(requirement.specifier)
-    if not specs:
+    """Raise the baseline without changing upper bounds, exclusions, or formatting."""
+    spec = baseline(requirement)
+    if spec is None:
         before, separator, marker = original.partition(";")
         return f"{before.rstrip()}>={latest}{' ' + separator + marker if separator else ''}"
-    spec = specs[0]
     if latest <= Version(spec.version):
         return None
-    pattern = rf"({re.escape(spec.operator)}\s*){re.escape(spec.version)}(?=\s|;|\)|$)"
+    pattern = rf"({re.escape(spec.operator)}\s*){re.escape(spec.version)}(?=\s|,|;|\)|$)"
     return re.sub(pattern, lambda match: f"{match[1]}{latest}", original, count=1)
 
 
@@ -138,7 +96,13 @@ def unsupported_reason(requirement: Requirement) -> str | None:
         return "URL dependency"
     specs = list(requirement.specifier)
     if len(specs) > 1:
-        return "multiple version constraints"
+        if (
+            sum(spec.operator == ">=" for spec in specs) == 1
+            and all(spec.operator in {">=", "<", "<=", "!="} for spec in specs)
+            and not any("*" in spec.version for spec in specs if spec.operator == ">=")
+        ):
+            return None
+        return "unsupported composite version constraints"
     if specs and (specs[0].operator not in {"==", ">=", "~="} or "*" in specs[0].version):
         return "unsupported version constraint"
     return None

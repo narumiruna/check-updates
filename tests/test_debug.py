@@ -1,6 +1,5 @@
 """Verify scoped debug diagnostics without real network requests."""
 
-import io
 import json
 import logging
 
@@ -10,7 +9,10 @@ from rich.text import Text
 from typer.testing import CliRunner
 
 from check_updates import cli
-from check_updates import dependencies
+from check_updates.indexes import Release
+from check_updates.indexes import ReleaseClient
+
+public_lookup = ReleaseClient._public
 
 runner = CliRunner()
 
@@ -20,7 +22,7 @@ def project(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     path = tmp_path / "pyproject.toml"
     path.write_text('[project]\ndependencies = ["demo>=1.0", "demo==1.0", "demo>=2.0", "other<1.0"]\n')
-    monkeypatch.setattr(cli, "latest_version", lambda _name: Version("2.0"))
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(Version("2.0"))])
     return path
 
 
@@ -59,7 +61,7 @@ def test_error_traceback_is_opt_in_and_logging_restored(project, monkeypatch, de
     def fail(_name):
         raise ValueError("lookup failed")
 
-    monkeypatch.setattr(cli, "latest_version", fail)
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(fail(name))])
     result = runner.invoke(cli.app, ["--debug"] if debug else [])
     assert result.exit_code == 1
     assert "Error: lookup failed" in result.stderr
@@ -85,18 +87,13 @@ def test_debug_pypi_filtering(project, monkeypatch):
         "6.0": [],
         "invalid": [],
     }
-    monkeypatch.setattr(cli, "latest_version", dependencies.latest_version)
-    monkeypatch.setattr(
-        dependencies,
-        "urlopen",
-        lambda *_args, **_kwargs: io.BytesIO(json.dumps({"releases": releases}).encode()),
-    )
+    monkeypatch.setattr(ReleaseClient, "_public", public_lookup)
+    monkeypatch.setattr(ReleaseClient, "_read", lambda self, request: (json.dumps({"releases": releases}).encode(), ""))
     result = runner.invoke(cli.app, ["--debug"])
     assert result.exit_code == 0, result.output
     assert "Requesting https://pypi.org/pypi/demo/json (timeout: 15s)" in result.stderr
     assert "Received 7 release entries" in result.stderr
-    assert "2 eligible, 1 invalid, 2 prerelease/dev, 2 empty or fully yanked" in result.stderr
-    assert "Selected latest stable release for demo: 2.0" in result.stderr
+    assert "Update available for demo: >=1.0 -> 2.0" in result.stderr
 
 
 def test_debug_workspace_discovery(project):

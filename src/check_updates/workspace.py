@@ -4,12 +4,15 @@ import logging
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 import tomlkit
 from packaging.utils import canonicalize_name
 from tomlkit.exceptions import ParseError
 from tomlkit.toml_document import TOMLDocument
+
+from check_updates.indexes import Index
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,11 @@ def read_project(path: Path) -> Project:
 
 
 def _uv_config(project: Project) -> Mapping:
-    return project.document.get("tool", {}).get("uv", {})
+    tool = project.document.get("tool", {})
+    if not isinstance(tool, Mapping) or not isinstance(tool.get("uv", {}), Mapping):
+        msg = "tool and tool.uv must be tables."
+        raise TypeError(msg)
+    return tool.get("uv", {})
 
 
 def _patterns(config: Mapping, key: str, *, required: bool = False) -> list[str]:
@@ -88,10 +95,97 @@ def load_projects(workspace: bool) -> list[Project]:
     return [root, *(read_project(path) for path in sorted(paths))]
 
 
+def _configured_indexes(config: Mapping) -> list[Index]:
+    items = config.get("index", [])
+    if not isinstance(items, list):
+        msg = "tool.uv.index must be an array of tables."
+        raise TypeError(msg)
+    result = []
+    for item in items:
+        if not isinstance(item, Mapping) or not isinstance(item.get("url"), str):
+            msg = "Each tool.uv.index entry needs a URL string."
+            raise TypeError(msg)
+        if item.get("name") is not None and not isinstance(item["name"], str):
+            msg = "Index names must be strings."
+            raise TypeError(msg)
+        if any(not isinstance(item.get(flag, False), bool) for flag in ("explicit", "default")):
+            msg = "Index explicit and default values must be booleans."
+            raise TypeError(msg)
+        authenticate = item.get("authenticate", "auto")
+        if authenticate not in ("auto", "always", "never"):
+            msg = "Index authenticate must be auto, always, or never."
+            raise ValueError(msg)
+        index = Index(
+            item["url"], item.get("name"), item.get("explicit", False), item.get("default", False), authenticate
+        )
+        result.append(index)
+    return result
+
+
+def _sources(root: Project, project: Project) -> dict:
+    sources = {}
+    for config in (_uv_config(root), _uv_config(project)):
+        entries = config.get("sources", {})
+        if not isinstance(entries, Mapping):
+            msg = "tool.uv.sources must be a table."
+            raise TypeError(msg)
+        sources.update({canonicalize_name(name): value for name, value in entries.items()})
+    return sources
+
+
+def _index_sources(source: object, section: tuple[str, ...]) -> list[Mapping]:
+    entries = source if isinstance(source, list) else [source]
+    extra = (
+        canonicalize_name(section[2])
+        if len(section) == 3 and section[:2] == ("project", "optional-dependencies")
+        else None
+    )
+    matched = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or "index" not in entry:
+            continue
+        if "extra" in entry:
+            if not isinstance(entry["extra"], str):
+                msg = "Index source extra must be a string."
+                raise TypeError(msg)
+            if extra is None or canonicalize_name(entry["extra"]) != extra:
+                continue
+        matched.append(entry)
+    return matched
+
+
+def package_indexes(
+    root: Project, project: Project, name: str, urls: list[str], *, section: tuple[str, ...] = ()
+) -> tuple[Index, ...]:
+    """Member definitions override root names; named sources never fall back to PyPI."""
+    if urls:
+        return tuple(Index(url, default=True) for url in urls)
+    definitions: dict[str, Index] = {}
+    for config in (_uv_config(root), _uv_config(project)):
+        for index in _configured_indexes(config):
+            definitions[index.name or index.url] = index
+    sources = _sources(root, project)
+    entries = _index_sources(sources.get(name, {}), section)
+    names = {entry["index"] for entry in entries}
+    if any("marker" in entry for entry in entries):
+        msg = f"Marker-specific index routing for {name} is not supported."
+        raise ValueError(msg)
+    if len(names) > 1:
+        msg = f"Multiple indexes for one dependency occurrence of {name} are not supported."
+        raise ValueError(msg)
+    if names:
+        index_name = next(iter(names))
+        if index_name not in definitions:
+            msg = f"Undefined named index for {name}."
+            raise ValueError(msg)
+        index = definitions[index_name]
+        return (replace(index, explicit=False, default=True),)
+    return tuple(sorted((i for i in definitions.values() if not i.explicit or i.default), key=lambda i: i.default))
+
+
 def workspace_dependencies(root: Project, project: Project) -> set[str]:
     """Respect root sources and member overrides for workspace dependencies."""
-    sources = dict(_uv_config(root).get("sources", {}))
-    sources.update(_uv_config(project).get("sources", {}))
+    sources = _sources(root, project)
     names = set()
     for name, source in sources.items():
         entries = source if isinstance(source, list) else [source]

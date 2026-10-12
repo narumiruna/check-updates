@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from check_updates import cli
 from check_updates import interactive
+from check_updates.indexes import Release
 from tests.test_cli import project as project
 from tests.test_workspace import workspace as workspace
 
@@ -56,7 +57,11 @@ def test_interactive_cli_with_real_keyboard_confirmation(project, terminal, monk
 def test_invalid_flags_fail_before_reads_or_lookups(project, terminal, monkeypatch, flags):
     original = project.read_bytes()
     monkeypatch.setattr(cli, "load_projects", lambda *_args: pytest.fail("Must not read files."))
-    monkeypatch.setattr(cli, "latest_version", lambda *_args: pytest.fail("Must not look up packages."))
+    monkeypatch.setattr(
+        cli.ReleaseClient,
+        "_public",
+        lambda self, name: [Release((lambda *_args: pytest.fail("Must not look up packages."))(name))],
+    )
     result = runner.invoke(cli.app, flags)
     assert result.exit_code == 2
     assert "cannot be combined" in result.output
@@ -203,12 +208,12 @@ def test_workspace_partial_selection_and_shared_lookups(workspace, terminal, mon
 def test_workspace_member_override_is_preserved(workspace, terminal, select_all):
     _root, member, _excluded, _unrelated, _lock, calls = workspace
     with member.open("a") as stream:
-        stream.write('[tool.uv.sources]\nbird-feeder = { index = "pypi" }\n')
+        stream.write("[tool.uv.sources]\nbird-feeder = {}\n")
     result = runner.invoke(cli.app, ["-i", "-w"])
     assert result.exit_code == 0, result.output
     assert calls == ["typer", "bird-feeder", "pytest"]
     assert "bird-feeder>=2.0" in member.read_text()
-    assert 'bird-feeder = { index = "pypi" }' in member.read_text()
+    assert "bird-feeder = {}" in member.read_text()
 
 
 def test_workspace_stale_last_file_blocks_all_writes(workspace, terminal, select_all, monkeypatch):
@@ -255,7 +260,7 @@ def test_workspace_lookup_failure_does_not_open_selector(workspace, terminal, mo
     def fetch(_name):
         raise TimeoutError("timeout")
 
-    monkeypatch.setattr(cli, "latest_version", fetch)
+    monkeypatch.setattr(cli.ReleaseClient, "_public", lambda self, name: [Release(fetch(name))])
     monkeypatch.setattr(cli, "select_updates", lambda _pending: pytest.fail("Must not open selector."))
     result = runner.invoke(cli.app, ["-i", "-w"])
     assert result.exit_code == 1
