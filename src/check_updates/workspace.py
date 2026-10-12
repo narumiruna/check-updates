@@ -22,7 +22,7 @@ class Project:
 
 
 def read_project(path: Path) -> Project:
-    logger.debug("Reading project file %s", path.resolve())
+    logger.debug("Reading project file %s", path)
     try:
         original = path.read_bytes()
         project = Project(path, tomlkit.parse(original.decode("utf-8")), original)

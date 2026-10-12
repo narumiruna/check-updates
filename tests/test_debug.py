@@ -6,6 +6,7 @@ import logging
 
 import pytest
 from packaging.version import Version
+from rich.text import Text
 from typer.testing import CliRunner
 
 from check_updates import cli
@@ -150,8 +151,28 @@ def test_invalid_options_restore_logging(project):
     assert "DEBUG" not in runner.invoke(cli.app).stderr
 
 
-def test_debug_help():
+@pytest.mark.parametrize("debug", [False, True])
+def test_cyclic_project_symlink_is_reported(tmp_path, monkeypatch, debug):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    path.symlink_to(path.name)
+    result = runner.invoke(cli.app, ["--debug"] if debug else [])
+    assert result.exit_code == 1
+    assert "Error: Cannot read pyproject.toml:" in result.stderr
+    assert ("Traceback (most recent call last)" in result.stderr) is debug
+    assert path.is_symlink()
+
+
+@pytest.mark.parametrize("force_color", [False, True])
+def test_debug_help(monkeypatch, force_color):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    if force_color:
+        monkeypatch.setenv("FORCE_COLOR", "1")
+    else:
+        monkeypatch.setenv("NO_COLOR", "1")
     result = runner.invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    assert "--debug" in result.stdout
-    assert "tracebacks" in result.stdout
+    text = Text.from_ansi(result.stdout).plain
+    assert "--debug" in text
+    assert "tracebacks" in text
