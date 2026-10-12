@@ -1,6 +1,7 @@
 """Read dependencies and find stable PyPI updates without resolving a project."""
 
 import json
+import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from packaging.version import Version
 from tomlkit.items import Array
 from tomlkit.items import String
 from tomlkit.toml_document import TOMLDocument
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -69,22 +72,39 @@ def dependencies(document: TOMLDocument) -> Iterator[Dependency]:
 def latest_version(name: str) -> Version:
     """Return the highest stable release with at least one non-yanked file."""
     url = f"https://pypi.org/pypi/{quote(canonicalize_name(name), safe='')}/json"
+    logger.debug("Requesting %s (timeout: 15s)", url)
     with urlopen(url, timeout=15) as response:
         data = json.load(response)
+    logger.debug("Received %d release entries for %s", len(data["releases"]), name)
     versions = []
+    invalid = unstable = unavailable = 0
     for value, files in data["releases"].items():
         try:
             version = Version(value)
         except InvalidVersion:
+            invalid += 1
             continue
         if version.is_prerelease or version.is_devrelease:
+            unstable += 1
             continue
         if any(not file.get("yanked", False) for file in files):
             versions.append(version)
+        else:
+            unavailable += 1
+    logger.debug(
+        "Release filtering for %s: %d eligible, %d invalid, %d prerelease/dev, %d empty or fully yanked",
+        name,
+        len(versions),
+        invalid,
+        unstable,
+        unavailable,
+    )
     if not versions:
         msg = f"No stable, non-yanked release found for {name}."
         raise ValueError(msg)
-    return max(versions)
+    latest = max(versions)
+    logger.debug("Selected latest stable release for %s: %s", name, latest)
+    return latest
 
 
 def replacement(requirement: Requirement, original: str, latest: Version) -> str | None:
