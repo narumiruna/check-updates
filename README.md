@@ -28,9 +28,20 @@ Review the changes and test your project after updating. If you manage the proje
 | `-i`, `--interactive` | Select updates, preview diffs, and confirm before writing |
 | `-u`, `--upgrade` | Write all available updates |
 | `-w`, `--workspace` | Check the uv workspace root and all included members |
+| `--debug` | Write detailed diagnostics and error tracebacks to stderr |
 | `--help` | Show command help |
 
 `-i` and `-u` cannot be combined. Both can be used with `-w`. Without `-i` or `-u`, the command only lists updates.
+
+### Debug diagnostics
+
+Add `--debug` to any mode to trace project discovery, workspace member selection, dependency checks and skip reasons, PyPI requests and release filtering, cache hits, update decisions, interactive selection and confirmation, and file writes. Errors include tracebacks. Normal stdout output and exit codes are unchanged.
+
+```sh
+uvx check-updates --debug -w 2>debug.log
+```
+
+Diagnostics do not dump project contents, request headers, or PyPI response bodies. Paths, package names, and exception messages can still contain sensitive information; review logs before sharing them.
 
 ### Example output
 
