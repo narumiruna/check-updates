@@ -83,7 +83,7 @@ def test_upgrade_target_and_python_metadata(catalog, target, expected):
     lock = path.with_name("uv.lock")
     lock.write_bytes(b"unchanged")
     before = path.read_bytes()
-    result = runner.invoke(cli.app, ["-u", "--target", target, "--include", "demo-pkg"])
+    result = runner.invoke(cli.app, ["-u", "--no-lock", "--target", target, "--include", "demo-pkg"])
     assert result.exit_code == 0, result.output
     assert path.read_bytes() == before.replace(b"1.2.3", expected.encode())
     assert lock.read_bytes() == b"unchanged"
