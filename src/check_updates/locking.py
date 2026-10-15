@@ -1,6 +1,7 @@
 """Run uv lock after requirement files have been written successfully."""
 
 import logging
+import os
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -47,9 +48,10 @@ def lock_project(directory: Path) -> None:
             return
         typer.echo(f"Running uv lock in {directory}...")
         logger.debug("Running uv lock in %s", directory)
-        # Inherit output and environment; closed input prevents subprocess prompts.
-        # run() waits for the child and cleans it up if interrupted.
-        subprocess.run(["uv", "lock"], cwd=directory, stdin=subprocess.DEVNULL, check=True)
+        # Keep credentials and configuration, but not project or frozen-mode overrides.
+        env = {key: value for key, value in os.environ.items() if key not in {"UV_PROJECT", "UV_FROZEN"}}
+        # Closed input prevents prompts; run() cleans up the child if interrupted.
+        subprocess.run(["uv", "lock"], cwd=directory, env=env, stdin=subprocess.DEVNULL, check=True)
     except KeyboardInterrupt as error:
         logger.debug("uv lock interrupted after writes", exc_info=True)
         typer.echo(f"Interrupted during uv lock; lock completion is not confirmed. {recovery}", err=True)

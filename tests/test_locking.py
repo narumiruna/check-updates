@@ -1,6 +1,7 @@
 """Automatic locking tests use mocked processes and release lookups."""
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -33,7 +34,8 @@ def test_locks_once_after_writes(project, terminal, monkeypatch, flags):
     monkeypatch.setattr(locking.subprocess, "run", run)
     result = runner.invoke(cli.app, flags)
     assert result.exit_code == 0, result.output
-    assert calls == [(["uv", "lock"], {"cwd": project.parent, "stdin": subprocess.DEVNULL, "check": True})]
+    env = {key: value for key, value in os.environ.items() if key not in {"UV_PROJECT", "UV_FROZEN"}}
+    assert calls == [(["uv", "lock"], {"cwd": project.parent, "env": env, "stdin": subprocess.DEVNULL, "check": True})]
     assert lock.read_bytes() == b"new lock\n"
     assert "Running uv lock" in result.stdout
     assert "uv lock completed." in result.stdout
@@ -149,5 +151,33 @@ def test_lookup_options_are_not_forwarded_to_uv(project, monkeypatch, lock_proce
         ["-u", "--index", "https://user:secret@example.com/simple/", "--include", "typer", "--no-cache"],
     )
     assert result.exit_code == 0, result.output
-    assert lock_process == [(["uv", "lock"], {"cwd": project.parent, "stdin": subprocess.DEVNULL, "check": True})]
+    env = {key: value for key, value in os.environ.items() if key not in {"UV_PROJECT", "UV_FROZEN"}}
+    assert lock_process == [
+        (["uv", "lock"], {"cwd": project.parent, "env": env, "stdin": subprocess.DEVNULL, "check": True})
+    ]
     assert "secret" not in result.output
+
+
+@pytest.mark.parametrize("flags", [["-u"], ["-i"]])
+@pytest.mark.parametrize(
+    "overrides",
+    [{"UV_PROJECT": "/other/project"}, {"UV_FROZEN": "1"}, {"UV_PROJECT": "/other/project", "UV_FROZEN": "1"}],
+)
+def test_lock_environment_keeps_config_but_removes_semantic_overrides(
+    project, terminal, monkeypatch, lock_process, flags, overrides
+):
+    project.with_name("uv.lock").write_bytes(b"old lock\n")
+    for key, value in overrides.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("UV_INDEX_PRIVATE_PASSWORD", "test-secret")
+    monkeypatch.setenv("UV_CONFIG_FILE", "/config/uv.toml")
+    monkeypatch.setattr(cli, "select_updates", lambda pending: pending)
+    monkeypatch.setattr(cli, "confirm_changes", lambda: True)
+    original_env = dict(os.environ)
+    result = runner.invoke(cli.app, flags)
+    assert result.exit_code == 0, result.output
+    assert len(lock_process) == 1
+    child_env = lock_process[0][1]["env"]
+    assert child_env == {key: value for key, value in original_env.items() if key not in {"UV_PROJECT", "UV_FROZEN"}}
+    assert dict(os.environ) == original_env
+    assert "test-secret" not in result.output
