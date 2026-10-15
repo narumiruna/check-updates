@@ -222,6 +222,50 @@ def test_without_workspace_flag_does_not_lock_parent(workspace, monkeypatch, loc
     assert lock_process == []
 
 
+@pytest.mark.parametrize("flags", [["-u"], ["-i"]])
+def test_member_with_local_lock_does_not_lock_parent(workspace, terminal, monkeypatch, lock_process, flags):
+    root, member, _excluded, _unrelated, parent_lock, _calls = workspace
+    local_lock = member.with_name("uv.lock")
+    local_lock.write_bytes(b"local lock\n")
+    originals = {path: path.read_bytes() for path in (root, parent_lock, local_lock)}
+    monkeypatch.chdir(member.parent)
+    monkeypatch.setattr(cli, "select_updates", lambda pending: pending)
+    monkeypatch.setattr(cli, "confirm_changes", lambda: True)
+    result = runner.invoke(cli.app, flags)
+    assert result.exit_code == 0, result.output
+    assert "typer[all]>=2.0" in member.read_text()
+    assert all(path.read_bytes() == content for path, content in originals.items())
+    assert lock_process == []
+    assert "Skipping uv lock: parent workspace found" in result.stderr
+    assert "Use -w" in result.stderr
+    assert "uv lock completed" not in result.output
+
+
+def test_local_workspace_stops_parent_lock_guard(workspace, monkeypatch, lock_process):
+    _root, member, *_rest = workspace
+    member.write_text(member.read_text() + "\n[tool.uv.workspace]\nmembers = []\n")
+    member.with_name("uv.lock").write_bytes(b"local lock\n")
+    monkeypatch.chdir(member.parent)
+    result = runner.invoke(cli.app, ["-u"])
+    assert result.exit_code == 0, result.output
+    assert len(lock_process) == 1
+    assert lock_process[0][1]["cwd"] == member.parent
+    assert "Skipping uv lock" not in result.output
+
+
+def test_parent_inspection_failure_keeps_writes_without_locking(workspace, monkeypatch, lock_process):
+    root, member, *_rest = workspace
+    root.write_text("[invalid toml")
+    member.with_name("uv.lock").write_bytes(b"local lock\n")
+    monkeypatch.chdir(member.parent)
+    result = runner.invoke(cli.app, ["-u"])
+    assert result.exit_code == 1, result.output
+    assert "typer[all]>=2.0" in member.read_text()
+    assert lock_process == []
+    assert "Requirement files were updated" in result.stderr
+    assert "uv lock completed" not in result.output
+
+
 def test_partial_workspace_write_failure_does_not_lock(workspace, monkeypatch, lock_process):
     root, member, *_rest = workspace
     original = member.read_bytes()

@@ -54,7 +54,7 @@ After `-u` or confirmed `-i` writes updates, the command runs plain `uv lock` on
 uvx check-updates -u --no-lock
 ```
 
-With `-w`, locking runs at the discovered workspace root, even if only a member changes. Without `-w`, only the current project directory is inspected for `uv.lock`; a parent workspace lockfile is not selected. Use `-w` to update a workspace's shared lockfile from a member.
+With `-w`, locking runs at the discovered workspace root, even if only a member changes. Without `-w`, only the current project directory is inspected for `uv.lock`; a parent workspace lockfile is not selected. If a local lockfile exists, the command also checks parent `pyproject.toml` files for a workspace. When a parent workspace exists, automatic locking is skipped, even if the current project is excluded from it. Requirement updates remain, and a message gives recovery steps. A workspace declared in the current project stops this parent check. Use `-w` to update a workspace's shared lockfile from a member.
 
 Locking requires `uv` on `PATH` and can access the network. It uses uv's normal configuration and inherited environment. Lookup options such as `--index`, selection options, and `--no-cache` are not forwarded to uv. Configure uv separately if lock resolution needs a different index. Child input is closed, so authentication cannot prompt; configure credentials before running the command.
 
