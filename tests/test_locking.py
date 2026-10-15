@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 from typer.testing import CliRunner
 
 from check_updates import cli
@@ -77,12 +78,16 @@ def test_no_updates_skips_locking(project, terminal, lock_process, flags):
     assert lock_process == []
 
 
+@pytest.mark.parametrize("force_color", [False, True])
 @pytest.mark.parametrize("flags", [[], ["--format", "json"], ["--diff"], ["--check"], ["-w"]])
-def test_no_lock_requires_write_mode_before_reads(monkeypatch, flags):
+def test_no_lock_requires_write_mode_before_reads(monkeypatch, flags, force_color):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR" if force_color else "NO_COLOR", "1")
     monkeypatch.setattr(cli, "load_projects", lambda *_args: pytest.fail("Must not read projects."))
     result = runner.invoke(cli.app, [*flags, "--no-lock"])
     assert result.exit_code == 2, result.output
-    assert "--no-lock requires" in result.output
+    assert "--no-lock requires" in Text.from_ansi(result.output).plain
 
 
 @pytest.mark.parametrize("debug", [False, True])

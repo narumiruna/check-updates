@@ -27,7 +27,8 @@ def project(tmp_path, monkeypatch):
     return path
 
 
-def test_list_does_not_edit(project):
+def test_list_does_not_edit(project, monkeypatch):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
     original = project.read_bytes()
     result = runner.invoke(cli.app)
     assert result.exit_code == 0, result.output
