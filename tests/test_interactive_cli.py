@@ -89,6 +89,23 @@ def test_empty_selection_does_not_confirm_or_write(project, terminal, monkeypatc
     assert project.read_bytes() == original
 
 
+@pytest.mark.parametrize("selection", ["empty", "declined", "accepted-no-lock"])
+def test_interactive_skips_locking(project, terminal, monkeypatch, lock_process, selection):
+    lock = project.with_name("uv.lock")
+    lock.write_bytes(b"old lock\n")
+    original = project.read_bytes()
+    monkeypatch.setattr(cli, "select_updates", lambda pending: [] if selection == "empty" else pending)
+    monkeypatch.setattr(cli, "confirm_changes", lambda: selection == "accepted-no-lock")
+    flags = ["-i", *(["--no-lock"] if selection == "accepted-no-lock" else [])]
+    result = runner.invoke(cli.app, flags)
+    assert result.exit_code == 0, result.output
+    assert lock_process == []
+    assert lock.read_bytes() == b"old lock\n"
+    assert project.read_bytes() == (
+        original.replace(b"0.27.1", b"0.27.3") if selection == "accepted-no-lock" else original
+    )
+
+
 def test_no_updates_does_not_open_selector(project, terminal, monkeypatch):
     project.write_text('[project]\ndependencies = ["typer>=0.27.3"]\n')
     original = project.read_bytes()
@@ -182,7 +199,7 @@ def test_file_write_error_identifies_path(project, terminal, select_all, monkeyp
 
 
 @pytest.mark.parametrize("include_root", [False, True])
-def test_workspace_partial_selection_and_shared_lookups(workspace, terminal, monkeypatch, include_root):
+def test_workspace_partial_selection_and_shared_lookups(workspace, terminal, monkeypatch, include_root, lock_process):
     root, member, excluded, unrelated, lock, calls = workspace
     originals = {path: path.read_bytes() for path in (root, member, excluded, unrelated, lock)}
 
@@ -203,6 +220,8 @@ def test_workspace_partial_selection_and_shared_lookups(workspace, terminal, mon
     assert f"--- {member}" in result.output
     assert (f"--- {root}" in result.output) == include_root
     assert 'dev = ["pytest==2.0"]' not in result.output
+    assert len(lock_process) == 1
+    assert lock_process[0][1]["cwd"] == root.parent
 
 
 def test_workspace_member_override_is_preserved(workspace, terminal, select_all):
@@ -216,7 +235,7 @@ def test_workspace_member_override_is_preserved(workspace, terminal, select_all)
     assert "bird-feeder = {}" in member.read_text()
 
 
-def test_workspace_stale_last_file_blocks_all_writes(workspace, terminal, select_all, monkeypatch):
+def test_workspace_stale_last_file_blocks_all_writes(workspace, terminal, select_all, monkeypatch, lock_process):
     root, member, *_rest = workspace
     root_original = root.read_bytes()
     member_original = member.read_bytes()
@@ -231,9 +250,10 @@ def test_workspace_stale_last_file_blocks_all_writes(workspace, terminal, select
     assert "changed during review" in result.output
     assert root.read_bytes() == root_original
     assert member.read_bytes() == member_original + b"# User edit.\n"
+    assert lock_process == []
 
 
-def test_workspace_write_failure_reports_prior_success(workspace, terminal, select_all, monkeypatch):
+def test_workspace_write_failure_reports_prior_success(workspace, terminal, select_all, monkeypatch, lock_process):
     root, member, *_rest = workspace
     root_original = root.read_bytes()
     member_original = member.read_bytes()
@@ -251,6 +271,7 @@ def test_workspace_write_failure_reports_prior_success(workspace, terminal, sele
     assert f"Cannot write {member}" in result.output
     assert root.read_bytes() == root_original.replace(b"1.0", b"2.0")
     assert member.read_bytes() == member_original
+    assert lock_process == []
 
 
 def test_workspace_lookup_failure_does_not_open_selector(workspace, terminal, monkeypatch):

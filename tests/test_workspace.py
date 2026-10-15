@@ -11,7 +11,7 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def workspace(tmp_path, monkeypatch):
+def workspace(tmp_path, monkeypatch, lock_process):
     monkeypatch.chdir(tmp_path)
     root = tmp_path / "pyproject.toml"
     root.write_text(
@@ -61,7 +61,7 @@ def test_workspace_listing_does_not_edit(workspace, flag):
 
 
 @pytest.mark.parametrize("flags", [["-u", "-w"], ["--upgrade", "--workspace"]])
-def test_upgrade_workspace_preserves_format_and_selection(workspace, flags):
+def test_upgrade_workspace_preserves_format_and_selection(workspace, flags, lock_process):
     root, member, excluded, unrelated, lock, calls = workspace
     originals = {path: path.read_bytes() for path in (root, member, excluded, unrelated, lock)}
     result = runner.invoke(cli.app, flags)
@@ -72,9 +72,12 @@ def test_upgrade_workspace_preserves_format_and_selection(workspace, flags):
         assert path.read_bytes() == originals[path]
     assert calls == ["typer", "pytest"]
     assert result.output.count(f"Updated 2 dependencies in {member}.") == 1
+    assert len(lock_process) == 1
+    assert lock_process[0][0] == ["uv", "lock"]
+    assert lock_process[0][1]["cwd"] == root.parent
 
 
-def test_workspace_root_discovery_from_member_subdirectory(workspace, monkeypatch):
+def test_workspace_root_discovery_from_member_subdirectory(workspace, monkeypatch, lock_process):
     root, member, *_rest = workspace
     directory = member.parent / "src"
     directory.mkdir()
@@ -83,6 +86,8 @@ def test_workspace_root_discovery_from_member_subdirectory(workspace, monkeypatc
     assert result.exit_code == 0, result.output
     assert "typer>=2.0" in root.read_text()
     assert "typer[all]>=2.0" in member.read_text()
+    assert len(lock_process) == 1
+    assert lock_process[0][1]["cwd"] == root.parent
 
 
 def test_without_workspace_flag_updates_only_current_project(workspace):
@@ -97,7 +102,7 @@ def test_without_workspace_flag_updates_only_current_project(workspace):
     assert calls == ["typer"]
 
 
-def test_workspace_lookup_failure_does_not_edit_any_project(workspace, monkeypatch):
+def test_workspace_lookup_failure_does_not_edit_any_project(workspace, monkeypatch, lock_process):
     root, member, *_rest = workspace
     originals = {path: path.read_bytes() for path in (root, member)}
 
@@ -111,6 +116,7 @@ def test_workspace_lookup_failure_does_not_edit_any_project(workspace, monkeypat
     assert result.exit_code == 1
     assert "unavailable" in result.output
     assert all(path.read_bytes() == content for path, content in originals.items())
+    assert lock_process == []
 
 
 @pytest.mark.parametrize("problem", ["missing-file", "invalid-toml", "missing-directory"])
@@ -191,3 +197,44 @@ def test_workspace_source_lists_and_external_workspaces(workspace):
     result = runner.invoke(cli.app, ["-w"])
     assert result.exit_code == 0, result.output
     assert calls == ["typer"]
+
+
+def test_unchanged_workspace_root_still_owns_lock(workspace, lock_process):
+    root, member, *_rest = workspace
+    root.write_text(root.read_text().replace("typer>=1.0", "typer>=2.0"))
+    original = root.read_bytes()
+    result = runner.invoke(cli.app, ["-u", "-w"])
+    assert result.exit_code == 0, result.output
+    assert root.read_bytes() == original
+    assert "typer[all]>=2.0" in member.read_text()
+    assert len(lock_process) == 1
+    assert lock_process[0][1]["cwd"] == root.parent
+
+
+def test_without_workspace_flag_does_not_lock_parent(workspace, monkeypatch, lock_process):
+    root, member, *_rest = workspace
+    original = root.read_bytes()
+    monkeypatch.chdir(member.parent)
+    result = runner.invoke(cli.app, ["-u"])
+    assert result.exit_code == 0, result.output
+    assert root.read_bytes() == original
+    assert "typer[all]>=2.0" in member.read_text()
+    assert lock_process == []
+
+
+def test_partial_workspace_write_failure_does_not_lock(workspace, monkeypatch, lock_process):
+    root, member, *_rest = workspace
+    original = member.read_bytes()
+    write_change = cli.write_change
+
+    def write(change):
+        if change.project.path == member:
+            raise PermissionError("denied")
+        write_change(change)
+
+    monkeypatch.setattr(cli, "write_change", write)
+    result = runner.invoke(cli.app, ["-u", "-w"])
+    assert result.exit_code == 1, result.output
+    assert "typer>=2.0" in root.read_text()
+    assert member.read_bytes() == original
+    assert lock_process == []

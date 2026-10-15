@@ -26,6 +26,7 @@ from check_updates.diagnostics import debug_logging
 from check_updates.indexes import ReleaseClient
 from check_updates.interactive import confirm_changes
 from check_updates.interactive import select_updates
+from check_updates.locking import lock_project
 from check_updates.output import show_updates
 from check_updates.selection import Selection
 from check_updates.selection import choose_version
@@ -93,7 +94,7 @@ def _check_project(
 
 def _collect_updates(
     workspace: bool, selection: Selection, urls: list[str], *, no_cache: bool
-) -> list[tuple[Project, list[Update]]]:
+) -> tuple[Project, list[tuple[Project, list[Update]]]]:
     projects = load_projects(workspace)
     logger.debug("Loaded %d project files", len(projects))
     pending = []
@@ -109,7 +110,7 @@ def _collect_updates(
         len(pending),
         len(client.cache),
     )
-    return pending
+    return projects[0], pending
 
 
 def _interactive_changes(pending: list[tuple[Project, list[Update]]]) -> list[Change]:
@@ -158,6 +159,9 @@ def main(
     interactive: Annotated[
         bool, typer.Option("--interactive", "-i", help="Select updates, preview changes, and confirm before writing.")
     ] = False,
+    no_lock: Annotated[
+        bool, typer.Option("--no-lock", help="Skip automatic uv lock after -u or -i writes updates.")
+    ] = False,
     target: Annotated[str, typer.Option(help="Update limit: patch, minor, or latest.")] = "latest",
     include: Annotated[list[str] | None, typer.Option(help="Include package (repeatable).")] = None,
     exclude: Annotated[list[str] | None, typer.Option(help="Exclude package (repeatable).")] = None,
@@ -173,8 +177,10 @@ def main(
         bool, typer.Option("--debug", help="Write detailed diagnostics and error tracebacks to stderr.")
     ] = False,
 ) -> None:
-    """Check stable package releases without running lock or sync commands."""
+    """Check stable releases; lock existing uv projects after updates, without installing packages."""
     with debug_logging(debug):
+        if no_lock and not (upgrade or interactive):
+            raise typer.BadParameter("--no-lock requires --upgrade (-u) or --interactive (-i).")
         if target not in {"patch", "minor", "latest"}:
             raise typer.BadParameter("--target must be patch, minor, or latest.")
         if output_format not in {"table", "json"}:
@@ -198,6 +204,7 @@ def main(
             selection=selection,
             urls=index or [],
             no_cache=no_cache,
+            no_lock=no_lock,
             output_format=output_format,
             check=check,
             diff=diff,
@@ -212,7 +219,8 @@ def _display_updates(
     interactive: bool,
     upgrade: bool,
     workspace: bool,
-) -> None:
+) -> bool:
+    """Display updates and report whether a nonempty set of writes completed."""
     if output_format == "json":
         typer.echo(
             json.dumps(
@@ -243,7 +251,9 @@ def _display_updates(
     elif not pending:
         typer.echo("No dependency updates available.")
     elif interactive:
-        _write_changes(_interactive_changes(pending))
+        changes = _interactive_changes(pending)
+        _write_changes(changes)
+        return bool(changes)
     else:
         logger.debug("Displaying available updates")
         show_updates(pending, upgrade=upgrade, workspace=workspace)
@@ -251,6 +261,8 @@ def _display_updates(
             changes = [prepare_change(project, updates) for project, updates in pending]
             check_snapshots(changes)
             _write_changes(changes)
+            return bool(changes)
+    return False
 
 
 def _run(
@@ -261,6 +273,7 @@ def _run(
     selection: Selection,
     urls: list[str],
     no_cache: bool,
+    no_lock: bool,
     output_format: str,
     check: bool,
     diff: bool,
@@ -271,8 +284,8 @@ def _run(
     if interactive and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise typer.BadParameter("--interactive (-i) requires terminal input and output. Use -u for automatic updates.")
     try:
-        pending = _collect_updates(workspace, selection, urls, no_cache=no_cache)
-        _display_updates(
+        root, pending = _collect_updates(workspace, selection, urls, no_cache=no_cache)
+        written = _display_updates(
             pending,
             output_format=output_format,
             diff=diff,
@@ -280,6 +293,8 @@ def _run(
             upgrade=upgrade,
             workspace=workspace,
         )
+        if written and not no_lock:
+            lock_project(root.path.absolute().parent)
         if check and pending:
             raise typer.Exit(code=3)
         logger.debug("Command completed")

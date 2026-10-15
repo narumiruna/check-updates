@@ -2,7 +2,7 @@
 
 Check Python dependencies in `pyproject.toml` for newer stable releases on PyPI or configured package indexes, then choose which updates to apply.
 
-Run with `uvx`, provided by [`uv`](https://docs.astral.sh/uv/getting-started/installation/), without installing check-updates into your project environment. The tool only changes dependency requirements. It does not install packages, change lock files, or run `uv lock` or `uv sync`.
+Run with `uvx`, provided by [`uv`](https://docs.astral.sh/uv/getting-started/installation/), without installing check-updates into your project environment. After writing dependency updates, the tool runs `uv lock` if the selected project root already has `uv.lock`. Use `--no-lock` with `-u` or `-i` to update requirements only. The tool does not install packages or run `uv sync`.
 
 ## Quick start
 
@@ -19,7 +19,7 @@ uvx check-updates -i
 uvx check-updates -u
 ```
 
-Review the changes and test your project after updating. If you manage the project with uv, run `uv lock` or `uv sync` yourself when ready.
+Review the requirement and lockfile changes and test your project after updating. Run `uv sync` yourself when ready to install packages. If you used `--no-lock`, run `uv lock` first when ready to resolve dependencies.
 
 ### Options
 
@@ -27,6 +27,7 @@ Review the changes and test your project after updating. If you manage the proje
 | --- | --- |
 | `-i`, `--interactive` | Select updates, preview diffs, and confirm before writing |
 | `-u`, `--upgrade` | Write all available updates |
+| `--no-lock` | Skip automatic locking; requires `-u` or `-i` |
 | `-w`, `--workspace` | Check the uv workspace root and all included members |
 | `--target patch\|minor\|latest` | Limit updates relative to the requirement baseline; default: `latest` |
 | `--include NAME` | Include a package; repeat for multiple packages |
@@ -43,6 +44,23 @@ Review the changes and test your project after updating. If you manage the proje
 | `--help` | Show command help |
 
 `-i` and `-u` cannot be combined. Both can be used with `-w` and selection options. `--check`, `--diff`, and `--format json` cannot be combined with `-i` or `-u`. `--check` can accompany JSON or diff output; JSON and diff cannot be combined. Without `-i` or `-u`, no project files are changed.
+
+## Automatic locking
+
+After `-u` or confirmed `-i` writes updates, the command runs plain `uv lock` once in the selected project root if that directory already has a regular `uv.lock` file. No lockfile is created when one is absent. Read-only modes, no updates, empty selection, cancellation, and lookup, snapshot, or write failures do not run uv.
+
+```sh
+# Update requirements only, without running uv.
+uvx check-updates -u --no-lock
+```
+
+With `-w`, locking runs at the discovered workspace root, even if only a member changes. Without `-w`, only the current project directory is inspected for `uv.lock`; a parent workspace lockfile is not selected. Use `-w` to update a workspace's shared lockfile from a member.
+
+Locking requires `uv` on `PATH` and can access the network. It uses uv's normal configuration and inherited environment. Lookup options such as `--index`, selection options, and `--no-cache` are not forwarded to uv. Configure uv separately if lock resolution needs a different index. Child input is closed, so authentication cannot prompt; configure credentials before running the command.
+
+Plain `uv lock` does not request a full upgrade with `--upgrade`, but resolution can still change transitive dependencies. It does not sync the project environment. uv diagnostics are shown directly and are not sanitized by check-updates; review them before sharing.
+
+If uv is missing, cannot start, or exits with an error, check-updates returns `1`. Requirement changes remain, and `uv.lock` may be stale or changed. Correct the cause and run `uv lock` in the reported root directory, or review and restore the affected files using version control. An interrupt during locking returns `130`; requirement changes remain and lock completion is not confirmed. Neither failure automatically restores files.
 
 ## Update selection
 
@@ -157,7 +175,7 @@ exclude = ["packages/seeds"]
 - Root source definitions apply to members unless overridden by a member.
 - A missing workspace, a selected member without `pyproject.toml`, or a read or lookup failure stops the command with exit code `1`.
 
-Without `-w`, only the current directory's `pyproject.toml` is checked. Dependencies declared with `workspace = true` or an external workspace path in that file's `[tool.uv.sources]` are still skipped, with a reminder to use `-w` to check members. Parent workspace source definitions are only read with `-w`. Workspace discovery follows [uv workspace configuration](https://docs.astral.sh/uv/concepts/projects/workspaces/#getting-started). It does not run uv.
+Without `-w`, only the current directory's `pyproject.toml` is checked. Dependencies declared with `workspace = true` or an external workspace path in that file's `[tool.uv.sources]` are still skipped, with a reminder to use `-w` to check members. Parent workspace source definitions are only read with `-w`. Workspace discovery follows [uv workspace configuration](https://docs.astral.sh/uv/concepts/projects/workspaces/#getting-started). Discovery does not run uv. Successful update writes can run `uv lock` as described above.
 
 ## Update scope and limitations
 
@@ -173,7 +191,7 @@ When `[project].requires-python` exists, the tool uses its lowest admitted final
 
 A release is eligible if at least one non-yanked file has a `Requires-Python` range admitting that baseline. Missing metadata remains eligible; malformed ranges are ineligible when filtering is active. Each workspace project uses its own baseline. Without `requires-python`, no Python filtering is performed.
 
-This does **not** prove support for the project's entire Python range, wheel platform availability, transitive dependencies, or runtime compatibility. The tool does not resolve dependencies. Review release notes, resolve, and test before installing updates.
+This does **not** prove support for the project's entire Python range, wheel platform availability, transitive dependencies, or runtime compatibility. Update selection does not resolve dependencies. Automatic locking delegates resolution to uv. Review release notes and test before installing updates; resolve manually when automatic locking is skipped.
 
 ### Package indexes and authentication
 
@@ -197,7 +215,7 @@ explicit = true
 internal-package = { index = "internal" }
 ```
 
-With `-w`, root definitions are inherited and member definitions override matching names. Non-explicit indexes are tried in declaration order, with `default = true` indexes last. A default index replaces the implicit PyPI fallback, even when it is also explicit. Explicit indexes are queried only for packages assigned to them. If all eligible indexes return 404, or no index is eligible, a configured default still blocks PyPI. A named source uses only that index and never falls back. Undefined names and marker-specific index assignments are errors; marker-dependent routing is not evaluated. Global uv configuration, pip configuration, keyrings, and index-strategy settings are not read.
+With `-w`, root definitions are inherited and member definitions override matching names. Non-explicit indexes are tried in declaration order, with `default = true` indexes last. A default index replaces the implicit PyPI fallback, even when it is also explicit. Explicit indexes are queried only for packages assigned to them. If all eligible indexes return 404, or no index is eligible, a configured default still blocks PyPI. A named source uses only that index and never falls back. Undefined names and marker-specific index assignments are errors; marker-dependent routing is not evaluated. Update lookups do not read global uv configuration, pip configuration, keyrings, or index-strategy settings.
 
 Index sources with `extra = "cpu"` apply only to occurrences in `[project.optional-dependencies].cpu`. Each checked occurrence uses its own extra, including when the same package appears in several extras. Extra names use normalized matching. Runtime dependencies and dependency groups do not use extra-qualified sources. If no qualified source matches, normal index selection applies. An unqualified source still applies to every occurrence. Multiple matching index names for one occurrence are an error; marker-specific routing remains unsupported.
 
@@ -215,17 +233,17 @@ Public PyPI release metadata is cached for one hour under `$XDG_CACHE_HOME/check
 
 Metadata requests use a 15-second timeout and up to three attempts. Network connection failures, truncated responses, HTTP protocol errors, and HTTP `408`, `429`, `500`, `502`, `503`, and `504` are retried after 0.25 and 0.5 seconds. Failed response reads return a normal error after the last attempt. Error output does not include response data. Other HTTP errors are not retried. No dependency files are written until all lookups succeed.
 
-All file reads and index lookups finish before writing, so lookup failures do not cause partial updates. Multi-file writes are sequential, not transactional: if a write fails, earlier successful updates remain. Use the output and version control to review or restore changes.
+All requirement-file reads and index lookups finish before writing, so lookup failures do not cause partial updates. Multi-file writes are sequential, not transactional: if a write fails, earlier successful updates remain. Use the output and version control to review or restore changes.
 
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Completed, including no available updates, no selection, or cancelled confirmation |
-| `1` | File, parsing, or network error |
+| `1` | File, parsing, network, or automatic-lock error |
 | `2` | Invalid option value/combination, or interactive mode without terminal input and output |
 | `3` | `--check` found updates within the selected scope |
-| `130` | Interrupted with Ctrl+C |
+| `130` | Interrupted with Ctrl+C; updates remain if locking had started |
 
 ## Development
 

@@ -42,11 +42,11 @@ def test_list_does_not_edit(project):
 
 
 @pytest.mark.parametrize("flag", ["-u", "--upgrade"])
-def test_upgrade_preserves_format_and_does_not_touch_lock(project, flag):
+def test_upgrade_preserves_format_and_does_not_touch_lock_with_opt_out(project, flag):
     original = project.read_bytes()
     lock = project.with_name("uv.lock")
     lock.write_bytes(b"leave unchanged\n")
-    result = runner.invoke(cli.app, [flag])
+    result = runner.invoke(cli.app, [flag, "--no-lock"])
     assert result.exit_code == 0, result.output
     assert project.read_bytes() == original.replace(b"0.27.1", b"0.27.3")
     assert lock.read_bytes() == b"leave unchanged\n"
