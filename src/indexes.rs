@@ -17,10 +17,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::runtime::{Builder, Runtime};
 use url::Url;
 
 const CACHE_TTL: f64 = 3600.0;
+const CACHE_VERSION: u64 = 2;
 const INVALID_INDEX: &str =
     "Invalid index URL or authentication policy. Check authenticate and index credentials.";
 
@@ -31,6 +33,10 @@ type Metadata = (Vec<Release>, Option<String>);
 pub struct Release {
     pub version: Version,
     pub requires_python: Option<String>,
+    /// Upload time in Unix UTC seconds, rounded up for fractional timestamps.
+    /// None means the index did not provide a valid time.
+    pub uploaded: Option<i64>,
+    pub yanked: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -356,7 +362,7 @@ impl ReleaseClient {
                     "Index lookup failed for {name}. Check connectivity and index credentials."
                 ),
             };
-            let releases = simple_metadata(&body, &content_type, name)
+            let releases = simple_candidates_metadata(&body, &content_type, name)
                 .map_err(|_| anyhow!("Invalid Simple index metadata for {name}."))?;
             return Ok(Some((releases, link)));
         }
@@ -413,7 +419,7 @@ impl ReleaseClient {
         };
         let data: Value = serde_json::from_slice(&body)
             .map_err(|_| anyhow!("Invalid PyPI release metadata for {name}."))?;
-        let (releases, note) = public_releases(&data, name)?;
+        let (releases, note) = public_candidates(&data, name)?;
         if let Some(note) = &note {
             self.notes.insert(name.into(), note.clone());
         }
@@ -422,9 +428,16 @@ impl ReleaseClient {
         {
             let rows: Vec<Value> = releases
                 .iter()
-                .map(|r| json!([r.version.to_string(), r.requires_python]))
+                .map(|r| {
+                    json!([
+                        r.version.to_string(),
+                        r.requires_python,
+                        r.uploaded,
+                        r.yanked
+                    ])
+                })
                 .collect();
-            let payload = json!({"time": now(), "releases": rows, "project_urls": note.map(|n| json!({"Releases": n})).unwrap_or(json!({}))});
+            let payload = json!({"version": CACHE_VERSION, "time": now(), "releases": rows, "project_urls": note.map(|n| json!({"Releases": n})).unwrap_or(json!({}))});
             // Cache writes are disposable; failures must not fail a lookup.
             if path
                 .parent()
@@ -436,7 +449,14 @@ impl ReleaseClient {
         Ok(releases)
     }
 
+    /// Return stable, non-yanked artifacts for the legacy selection path.
     pub fn get(&mut self, name: &str, indexes: &[Index]) -> Result<Vec<Release>> {
+        Ok(eligible_legacy(self.get_candidates(name, indexes)?))
+    }
+
+    /// Return all recognized artifacts, including prereleases, development releases,
+    /// and yanked artifacts. Policy checks must use metadata from the same artifact.
+    pub fn get_candidates(&mut self, name: &str, indexes: &[Index]) -> Result<Vec<Release>> {
         let name = normalize(name);
         let key = (name.clone(), indexes.to_vec());
         if let Some(releases) = self.cache.get(&key) {
@@ -471,9 +491,11 @@ impl ReleaseClient {
     }
 }
 
-fn stable(value: &str) -> Option<Version> {
-    let version: Version = value.parse().ok()?;
-    (!version.is_pre() && !version.is_dev()).then_some(version)
+fn eligible_legacy(releases: Vec<Release>) -> Vec<Release> {
+    releases
+        .into_iter()
+        .filter(|release| !release.yanked && !release.version.is_pre() && !release.version.is_dev())
+        .collect()
 }
 
 fn distribution(filename: &str) -> Option<(String, Version)> {
@@ -512,7 +534,7 @@ fn distribution(filename: &str) -> Option<(String, Version)> {
         }
         (name, version)
     };
-    Some((normalize(name), stable(version)?))
+    Some((normalize(name), version.parse().ok()?))
 }
 
 fn python_requirement(value: Option<&Value>) -> Option<Option<String>> {
@@ -523,7 +545,12 @@ fn python_requirement(value: Option<&Value>) -> Option<Option<String>> {
     }
 }
 
+#[cfg(test)]
 fn simple_releases(files: &Value, name: &str) -> Result<Vec<Release>> {
+    Ok(eligible_legacy(simple_candidates(files, name)?))
+}
+
+fn simple_candidates(files: &Value, name: &str) -> Result<Vec<Release>> {
     let files = files
         .as_array()
         .filter(|files| files.iter().all(Value::is_object))
@@ -531,34 +558,48 @@ fn simple_releases(files: &Value, name: &str) -> Result<Vec<Release>> {
     let mut releases = Vec::new();
     for file in files {
         // PEP 691 yanked is false or a reason string. Even an empty reason is yanked.
-        if file
+        let yanked = file
             .get("yanked")
-            .is_some_and(|yanked| yanked != &Value::Bool(false))
-        {
-            continue;
-        }
+            .is_some_and(|yanked| yanked != &Value::Bool(false));
         let Some(filename) = file.get("filename").and_then(Value::as_str) else {
             continue;
         };
         let Some((package, version)) = distribution(filename) else {
             continue;
         };
-        if package == name
-            && let Some(requires_python) = python_requirement(file.get("requires-python"))
-        {
-            releases.push(Release {
-                version,
-                requires_python,
-            });
+        if package != name {
+            continue;
         }
+        let requires_python = match python_requirement(file.get("requires-python")) {
+            Some(requirement) => requirement,
+            // A yanked artifact can still explain a rejection, even if its Python
+            // metadata is malformed. It must never become eligible.
+            None if yanked => None,
+            None => continue,
+        };
+        releases.push(Release {
+            version,
+            requires_python,
+            uploaded: upload_time(file.get("upload-time")),
+            yanked,
+        });
     }
     Ok(releases)
 }
 
+#[cfg(test)]
 fn simple_metadata(body: &[u8], content_type: &str, name: &str) -> Result<Vec<Release>> {
+    Ok(eligible_legacy(simple_candidates_metadata(
+        body,
+        content_type,
+        name,
+    )?))
+}
+
+fn simple_candidates_metadata(body: &[u8], content_type: &str, name: &str) -> Result<Vec<Release>> {
     if content_type.to_ascii_lowercase().contains("json") {
         let data: Value = serde_json::from_slice(body)?;
-        simple_releases(
+        simple_candidates(
             data.get("files").ok_or_else(|| anyhow!("Missing files."))?,
             name,
         )
@@ -570,9 +611,9 @@ fn simple_metadata(body: &[u8], content_type: &str, name: &str) -> Result<Vec<Re
             if href.is_empty() { return None; }
             let path = href.split('#').next()?.split('?').next()?;
             let filename = percent_decode_str(path.rsplit('/').next()?).decode_utf8_lossy();
-            Some(json!({"filename": filename, "requires-python": anchor.value().attr("data-requires-python"), "yanked": anchor.value().attr("data-yanked").is_some()}))
+            Some(json!({"filename": filename, "requires-python": anchor.value().attr("data-requires-python"), "upload-time": anchor.value().attr("data-upload-time"), "yanked": anchor.value().attr("data-yanked").is_some()}))
         }).collect();
-        simple_releases(&Value::Array(files), name)
+        simple_candidates(&Value::Array(files), name)
     }
 }
 
@@ -587,7 +628,13 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
+#[cfg(test)]
 fn public_releases(data: &Value, name: &str) -> Result<Metadata> {
+    let (releases, note) = public_candidates(data, name)?;
+    Ok((eligible_legacy(releases), note))
+}
+
+fn public_candidates(data: &Value, name: &str) -> Result<Metadata> {
     let entries = data
         .get("releases")
         .and_then(Value::as_object)
@@ -595,25 +642,54 @@ fn public_releases(data: &Value, name: &str) -> Result<Metadata> {
     let note = release_notes(data.get("info").and_then(|info| info.get("project_urls")));
     let mut releases = Vec::new();
     for (value, files) in entries {
-        let Some(version) = stable(value) else {
+        let Ok(version) = value.parse::<Version>() else {
             continue;
         };
-        let files = files
+        let Some(files) = files
             .as_array()
             .filter(|files| files.iter().all(Value::is_object))
-            .ok_or_else(|| anyhow!("Invalid PyPI file metadata for {name}."))?;
-        for file in files {
-            if !file.get("yanked").is_some_and(truthy)
-                && let Some(requires_python) = python_requirement(file.get("requires_python"))
-            {
-                releases.push(Release {
-                    version: version.clone(),
-                    requires_python,
-                });
+        else {
+            // Legacy stable-only lookups ignored malformed prerelease entries.
+            if version.is_pre() || version.is_dev() {
+                continue;
             }
+            bail!("Invalid PyPI file metadata for {name}.");
+        };
+        for file in files {
+            let yanked = file.get("yanked").is_some_and(truthy);
+            let requires_python = match python_requirement(file.get("requires_python")) {
+                Some(requirement) => requirement,
+                None if yanked => None,
+                None => continue,
+            };
+            releases.push(Release {
+                version: version.clone(),
+                requires_python,
+                uploaded: upload_time(file.get("upload_time_iso_8601"))
+                    .or_else(|| public_upload_time(file.get("upload_time"))),
+                yanked,
+            });
         }
     }
     Ok((releases, note))
+}
+
+fn parse_upload_time(value: &str) -> Option<i64> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        // Cutoffs have whole-second precision. Round upload times up so an
+        // artifact just after the cutoff cannot pass here and fail in uv.
+        .map(|timestamp| timestamp.unix_timestamp() + i64::from(timestamp.nanosecond() != 0))
+}
+
+fn upload_time(value: Option<&Value>) -> Option<i64> {
+    parse_upload_time(value?.as_str()?)
+}
+
+fn public_upload_time(value: Option<&Value>) -> Option<i64> {
+    let value = value?.as_str()?;
+    // The legacy PyPI field omits the timezone, but specifies UTC.
+    parse_upload_time(value).or_else(|| parse_upload_time(&format!("{value}Z")))
 }
 
 fn release_notes(urls: Option<&Value>) -> Option<String> {
@@ -664,7 +740,10 @@ fn cache_path_from(name: &str, xdg: Option<&OsStr>, home: Option<PathBuf>) -> Op
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    Some(root.join("check-updates").join(format!("v1-{digest}.json")))
+    Some(
+        root.join("check-updates")
+            .join(format!("v{CACHE_VERSION}-{digest}.json")),
+    )
 }
 
 fn cache_path(name: &str) -> Option<PathBuf> {
@@ -675,6 +754,9 @@ fn cache_path(name: &str) -> Option<PathBuf> {
 
 fn load_cache(path: &PathBuf, now: f64) -> Option<Metadata> {
     let data: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    if data.get("version")?.as_u64()? != CACHE_VERSION {
+        return None;
+    }
     let age = now - data.get("time")?.as_f64()?;
     if !(0.0..CACHE_TTL).contains(&age) {
         return None;
@@ -682,14 +764,22 @@ fn load_cache(path: &PathBuf, now: f64) -> Option<Metadata> {
     let mut releases = Vec::new();
     for row in data.get("releases")?.as_array()? {
         let row = row.as_array()?;
-        if row.len() != 2 {
+        if row.len() != 4 {
             return None;
         }
         let version = row[0].as_str()?.parse().ok()?;
         let requires_python = python_requirement(Some(&row[1]))?;
+        let uploaded = if row[2].is_null() {
+            None
+        } else {
+            Some(row[2].as_i64()?)
+        };
+        let yanked = row[3].as_bool()?;
         releases.push(Release {
             version,
             requires_python,
+            uploaded,
+            yanked,
         });
     }
     Some((releases, release_notes(data.get("project_urls"))))
@@ -809,7 +899,237 @@ mod tests {
         Release {
             version: version.parse().unwrap(),
             requires_python: python.map(str::to_owned),
+            uploaded: None,
+            yanked: false,
         }
+    }
+
+    #[test]
+    fn raw_simple_candidates_retain_prereleases_development_and_yanked_files() {
+        let files = json!([
+            {"filename": "demo-1.zip"},
+            {"filename": "demo-2a1.tar.gz"},
+            {"filename": "demo-2b2-py3-none-any.whl"},
+            {"filename": "demo-2rc3.zip"},
+            {"filename": "demo-3.dev1.zip"},
+            {"filename": "demo-1!4+local.zip"},
+            {"filename": "demo-5.zip", "yanked": true, "requires-python": 42},
+            {"filename": "demo-6.zip", "yanked": ""},
+            {"filename": "demo-7.zip", "yanked": null},
+            {"filename": "demo-8.zip", "yanked": 0},
+            {"filename": "other-9.zip"}
+        ]);
+        let found = simple_candidates(&files, "demo").unwrap();
+        assert_eq!(found.len(), 10);
+        for (artifact, version) in found.iter().zip([
+            "1",
+            "2a1",
+            "2b2",
+            "2rc3",
+            "3.dev1",
+            "1!4+local",
+            "5",
+            "6",
+            "7",
+            "8",
+        ]) {
+            assert_eq!(artifact.version, version.parse::<Version>().unwrap());
+            assert_eq!(artifact.uploaded, None);
+        }
+        assert!(found[..6].iter().all(|release| !release.yanked));
+        assert!(found[6..].iter().all(|release| release.yanked));
+        assert_eq!(found[6].requires_python, None);
+        assert_eq!(
+            simple_releases(&files, "demo").unwrap(),
+            vec![release("1", None), release("1!4+local", None)]
+        );
+    }
+
+    #[test]
+    fn raw_public_candidates_retain_artifact_python_age_and_yanked_status() {
+        let data = json!({"releases": {
+            "1": [
+                {"requires_python": ">=3.12", "upload_time_iso_8601": "1970-01-01T00:00:01Z"},
+                {"requires_python": ">=3.8", "upload_time_iso_8601": "1970-01-01T00:00:02Z"},
+                {"requires_python": ">=3.8", "upload_time_iso_8601": "1970-01-01T00:00:02Z"}
+            ],
+            "2rc1": [{"upload_time": "1970-01-01T00:00:03"}],
+            "3.dev1": [{}],
+            "4": [{"yanked": true, "requires_python": [], "upload_time": "bad"}],
+            "bad": null
+        }});
+        let (found, _) = public_candidates(&data, "demo").unwrap();
+        assert_eq!(found.len(), 6);
+        assert_eq!(found[0].requires_python.as_deref(), Some(">=3.12"));
+        assert_eq!(found[0].uploaded, Some(1));
+        assert_eq!(found[1].requires_python.as_deref(), Some(">=3.8"));
+        assert_eq!(found[1].uploaded, Some(2));
+        assert_eq!(found[1], found[2]);
+        assert_eq!(found[3].version, "2rc1".parse::<Version>().unwrap());
+        assert_eq!(found[3].uploaded, Some(3));
+        assert!(found[4].version.is_dev());
+        assert!(found[5].yanked);
+        assert_eq!(found[5].uploaded, None);
+        assert_eq!(found[5].requires_python, None);
+        assert_eq!(eligible_legacy(found).len(), 3);
+    }
+
+    #[test]
+    fn upload_timestamp_parsing_uses_utc_and_preserves_future_times() {
+        for (value, expected) in [
+            ("1970-01-01T00:00:00Z", Some(0)),
+            ("1970-01-01T01:00:01+01:00", Some(1)),
+            ("1969-12-31T23:59:59Z", Some(-1)),
+            ("1970-01-01T00:00:02.123456Z", Some(3)),
+            ("1969-12-31T23:59:59.5Z", Some(0)),
+            ("9999-01-01T00:00:00Z", Some(253370764800)),
+            ("1970-01-01T00:00:00", None),
+            ("2026-02-30T00:00:00Z", None),
+            ("not a timestamp", None),
+            ("", None),
+        ] {
+            assert_eq!(upload_time(Some(&json!(value))), expected, "{value}");
+        }
+        for value in [Value::Null, json!(123), json!(true), json!([])] {
+            assert_eq!(upload_time(Some(&value)), None);
+            assert_eq!(public_upload_time(Some(&value)), None);
+        }
+        assert_eq!(upload_time(None), None);
+        assert_eq!(
+            public_upload_time(Some(&json!("1970-01-01T00:00:03"))),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn fractional_upload_times_cannot_cross_the_inclusive_cooldown_boundary() {
+        for (timestamp, eligible) in [
+            ("1970-01-01T00:00:02Z", true),
+            ("1970-01-01T00:00:02.000001Z", false),
+            ("1970-01-01T00:00:01.999999Z", true),
+        ] {
+            let data =
+                json!({"files":[{"filename":"demo-2-py3-none-any.whl","upload-time":timestamp}]});
+            let releases =
+                simple_candidates_metadata(data.to_string().as_bytes(), "application/json", "demo")
+                    .unwrap();
+            let policy = crate::selection::CandidatePolicy {
+                cutoff: Some(2),
+                ..Default::default()
+            };
+            let decision =
+                crate::selection::evaluate(&"demo>=1".parse().unwrap(), &releases, &policy, None);
+            assert_eq!(decision.selected.is_some(), eligible, "{timestamp}");
+        }
+    }
+
+    #[test]
+    fn public_timestamp_field_precedence_and_fallback() {
+        let data = json!({"releases": {"1": [
+            {"upload_time_iso_8601": "1970-01-01T00:00:01Z", "upload_time": "1970-01-01T00:00:02"},
+            {"upload_time_iso_8601": "bad", "upload_time": "1970-01-01T00:00:03"},
+            {"upload_time_iso_8601": 123, "upload_time": "1970-01-01T00:00:04+00:00"},
+            {"upload_time_iso_8601": "bad", "upload_time": "bad"},
+            {}
+        ]}});
+        let (found, _) = public_candidates(&data, "demo").unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|release| release.uploaded)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(3), Some(4), None, None]
+        );
+    }
+
+    #[test]
+    fn simple_json_and_html_upload_times_remain_per_artifact() {
+        let body = json!({"files": [
+            {"filename": "demo-1.zip", "requires-python": ">=3.12", "upload-time": "1970-01-01T00:00:01Z"},
+            {"filename": "demo-1.zip", "requires-python": ">=3.8", "upload-time": "1970-01-01T00:00:02Z"},
+            {"filename": "demo-2rc1.zip", "yanked": "", "upload-time": "bad"}
+        ]});
+        let json =
+            simple_candidates_metadata(body.to_string().as_bytes(), "application/json", "demo")
+                .unwrap();
+        let html = br#"<a href="demo-1.zip" data-requires-python="&gt;=3.12" data-upload-time="1970-01-01T00:00:01Z">a</a>
+            <a href="demo-1.zip" data-requires-python="&gt;=3.8" data-upload-time="1970-01-01T00:00:02Z">b</a>
+            <a href="demo-2rc1.zip" data-yanked="" data-upload-time="bad">c</a>"#;
+        assert_eq!(
+            simple_candidates_metadata(html, "text/html", "demo").unwrap(),
+            json
+        );
+        assert_eq!(json[0].uploaded, Some(1));
+        assert_eq!(json[0].requires_python.as_deref(), Some(">=3.12"));
+        assert_eq!(json[1].uploaded, Some(2));
+        assert_eq!(json[1].requires_python.as_deref(), Some(">=3.8"));
+        assert!(json[2].yanked);
+        assert_eq!(json[2].uploaded, None);
+        let unknown =
+            simple_candidates_metadata(br#"<a href="demo-1.zip">a</a>"#, "text/html", "demo")
+                .unwrap();
+        assert_eq!(unknown, vec![release("1", None)]);
+    }
+
+    #[test]
+    fn legacy_get_and_candidates_share_full_memory_metadata() {
+        for legacy_first in [false, true] {
+            let body = json!({"files": [
+                {"filename": "demo-1.zip", "upload-time": "1970-01-01T00:00:01Z"},
+                {"filename": "demo-2rc1.zip"},
+                {"filename": "demo-3.dev1.zip"},
+                {"filename": "demo-4.zip", "yanked": true}
+            ]});
+            let server =
+                Server::new(|_| vec![response(200, "application/json", &body.to_string())]);
+            let indexes = [index(&server.url)];
+            let mut client = client(true);
+            if legacy_first {
+                assert_eq!(client.get("Demo", &indexes).unwrap().len(), 1);
+            }
+            let candidates = client.get_candidates("Demo", &indexes).unwrap();
+            assert_eq!(candidates.len(), 4);
+            assert!(candidates[3].yanked);
+            assert_eq!(
+                client.get("demo", &indexes).unwrap(),
+                vec![Release {
+                    uploaded: Some(1),
+                    ..release("1", None)
+                }]
+            );
+            assert_eq!(client.get_candidates("DEMO", &indexes).unwrap(), candidates);
+            assert_eq!(server.count(), 1);
+            assert_eq!(
+                client.release_link("demo", &indexes),
+                Some(format!("{}/demo/", server.url))
+            );
+            assert!(client.project_link("demo").is_none());
+        }
+    }
+
+    #[test]
+    fn yanked_only_first_index_is_retained_without_fallback() {
+        let first = Server::new(|_| {
+            vec![response(
+                200,
+                "application/json",
+                r#"{"files":[{"filename":"demo-2.zip","yanked":true,"requires-python":false}]}"#,
+            )]
+        });
+        let second = Server::new(|_| vec![]);
+        let indexes = [index(&first.url), index(&second.url)];
+        let mut client = client(false);
+        assert!(client.get("demo", &indexes).unwrap().is_empty());
+        let candidates = client.get_candidates("demo", &indexes).unwrap();
+        assert_eq!(
+            candidates,
+            vec![Release {
+                yanked: true,
+                ..release("2", None)
+            }]
+        );
+        assert_eq!(first.count(), 1);
+        assert_eq!(second.count(), 0);
     }
 
     #[test]
@@ -1445,7 +1765,7 @@ mod tests {
             assert!(path.is_absolute());
             assert_eq!(
                 path.file_name().unwrap(),
-                "v1-28b7c910e36c4f2cecd473867b3970ce142603a97488894aa391cba645d39e85.json"
+                "v2-28b7c910e36c4f2cecd473867b3970ce142603a97488894aa391cba645d39e85.json"
             );
         }
         let configured = temp.path().join("configured");
@@ -1463,7 +1783,7 @@ mod tests {
     fn cache_validation_ttl_future_and_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.json");
-        let data = json!({"time": 10000, "releases": [["2", ">=3.10"]], "project_urls": {"Releases": "https://example.org/notes"}});
+        let data = json!({"version": CACHE_VERSION, "time": 10000, "releases": [["2", ">=3.10", null, false]], "project_urls": {"Releases": "https://example.org/notes"}});
         fs::write(&path, data.to_string()).unwrap();
         assert_eq!(
             load_cache(&path, 10000.0).unwrap().0,
@@ -1474,16 +1794,95 @@ mod tests {
         assert!(load_cache(&path, 9999.0).is_none());
         for data in [
             json!([]),
-            json!({"time":10000, "releases":[["bad", null]]}),
-            json!({"time":10000, "releases":[["1", false]]}),
-            json!({"time":10000, "releases":[["1"]]}),
-            json!({"time":"10000", "releases":[]}),
+            json!({"version":CACHE_VERSION, "time":10000, "releases":[["bad", null, null, false]]}),
+            json!({"version":CACHE_VERSION, "time":10000, "releases":[["1", false, null, false]]}),
+            json!({"version":CACHE_VERSION, "time":10000, "releases":[["1"]]}),
+            json!({"version":CACHE_VERSION, "time":"10000", "releases":[]}),
         ] {
             fs::write(&path, data.to_string()).unwrap();
             assert!(load_cache(&path, 10000.0).is_none());
         }
         fs::write(&path, "broken").unwrap();
         assert!(load_cache(&path, 10000.0).is_none());
+    }
+
+    #[test]
+    fn cache_rejects_old_schema_and_corrupt_metadata_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        for payload in [
+            json!({"time": 10000, "releases": [["1", null]]}),
+            json!({"version": 1, "time": 10000, "releases": [["1", null]]}),
+            json!({"version": CACHE_VERSION, "time": 10000, "releases": [["1", null]]}),
+            json!({"version": CACHE_VERSION + 1, "time": 10000, "releases": []}),
+            json!({"version": "2", "time": 10000, "releases": []}),
+        ] {
+            fs::write(&path, payload.to_string()).unwrap();
+            assert!(load_cache(&path, 10000.0).is_none(), "{payload}");
+        }
+        for row in [
+            json!(["1", null, "123", false]),
+            json!(["1", null, 1.5, false]),
+            json!(["1", null, u64::MAX, false]),
+            json!(["1", null, false, false]),
+            json!(["1", null, null, null]),
+            json!(["1", null, null, "true"]),
+            json!(["1", null, null, 1]),
+            json!(["1", null, null, false, "extra"]),
+            json!({"version": "1"}),
+        ] {
+            // A corrupt later row must invalidate the entire cache, not return a
+            // partial set that could change the update decision.
+            let payload = json!({"version": CACHE_VERSION, "time": 10000, "releases": [["0", null, null, false], row]});
+            fs::write(&path, payload.to_string()).unwrap();
+            assert!(load_cache(&path, 10000.0).is_none(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn public_cache_roundtrip_keeps_all_artifact_metadata_and_replaces_old_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        fs::write(
+            &path,
+            json!({"time": now(), "releases": [["99", null]]}).to_string(),
+        )
+        .unwrap();
+        let body = json!({"releases": {
+            "1": [
+                {"requires_python": ">=3.12", "upload_time_iso_8601": "1970-01-01T00:00:01Z"},
+                {"requires_python": ">=3.8", "upload_time_iso_8601": "1970-01-01T00:00:02Z"}
+            ],
+            "2rc1": [{"upload_time_iso_8601": "9999-01-01T00:00:00Z"}],
+            "3.dev1": [{}],
+            "4": [{"yanked": true, "requires_python": false}]
+        }});
+        let server = Server::new(|_| vec![response(200, "application/json", &body.to_string())]);
+        let fetched = client(false)
+            .public_from("demo", &server.url, Some(path.clone()))
+            .unwrap();
+        assert_eq!(fetched.len(), 5);
+        let cached = client(false)
+            .public_from("demo", &server.url, Some(path.clone()))
+            .unwrap();
+        assert_eq!(cached, fetched);
+        assert_eq!(server.count(), 1);
+        assert_eq!(cached[0].uploaded, Some(1));
+        assert_eq!(cached[1].uploaded, Some(2));
+        assert!(cached[2].version.is_pre());
+        assert_eq!(cached[2].uploaded, Some(253370764800));
+        assert!(cached[3].version.is_dev());
+        assert!(cached[4].yanked);
+        assert_eq!(eligible_legacy(cached).len(), 2);
+        let payload: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(payload["version"], CACHE_VERSION);
+        assert!(
+            payload["releases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.as_array().unwrap().len() == 4)
+        );
     }
 
     #[test]

@@ -1,10 +1,14 @@
 pub mod changes;
 pub mod dependencies;
+pub mod doctor;
 pub mod indexes;
 pub mod interactive;
+pub mod locked;
 pub mod locking;
 pub mod output;
+pub mod policy;
 pub mod selection;
+pub mod verification;
 pub mod workspace;
 
 use std::sync::atomic::{AtomicBool, Ordering};

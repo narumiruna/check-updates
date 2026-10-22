@@ -58,6 +58,25 @@ pub fn prepare_change<'a>(project: &'a Project, updates: &[Update]) -> Result<Ch
     })
 }
 
+/// Remove URL credentials and query data from diagnostic text, not project bytes.
+pub fn redact_urls(value: &str) -> String {
+    static URLS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+"#).unwrap()
+    });
+    URLS.replace_all(value, |captures: &regex::Captures<'_>| {
+        let Ok(mut url) = url::Url::parse(&captures[0]) else {
+            return "[redacted URL]".to_owned();
+        };
+        if url.set_username("").is_err() || url.set_password(None).is_err() {
+            return "[redacted URL]".to_owned();
+        }
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    })
+    .into_owned()
+}
+
 /// Escape terminal controls without changing bytes written to the project.
 pub fn safe_text(value: &str, multiline: bool) -> String {
     let mut output = String::new();
@@ -122,6 +141,18 @@ pub fn write_changes(changes: &[Change<'_>]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_urls_do_not_expose_credentials_queries_or_fragments() {
+        let safe = redact_urls(
+            "demo @ https://user:secret@example.org/demo.whl?token=private#password=hidden ; python_version < '4'",
+        );
+        assert_eq!(
+            safe,
+            "demo @ https://example.org/demo.whl ; python_version < '4'"
+        );
+        assert!(!redact_urls("https://secret@%invalid").contains("secret"));
+    }
     use crate::dependencies::dependencies;
     use crate::workspace::read_project;
 

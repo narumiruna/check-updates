@@ -13,6 +13,7 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -22,10 +23,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.13.0"
+      - name: Prepare Python for offline resolver fixtures
+        run: uv python install 3.12
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - uses: astral-sh/setup-uv@v7
       - name: Build Python distributions
         run: uv build
       - name: Smoke-test native wheel with uvx
