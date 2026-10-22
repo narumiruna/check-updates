@@ -19,7 +19,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
-comfy-table = "7"
+comfy-table = "8"
 crossterm = "0.29"
 glob = "0.3"
 pep440_rs = "0.7.3"
