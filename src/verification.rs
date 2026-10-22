@@ -160,6 +160,8 @@ fn snapshot(snapshots: &mut Vec<Snapshot>, path: PathBuf) -> Result<()> {
 fn controlled_environment(command: &mut Command) -> Result<()> {
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
+        #[cfg(windows)]
+        let name = std::borrow::Cow::<str>::Owned(name.to_ascii_uppercase());
         if name.starts_with("UV_") {
             // These values cannot affect resolution, or are explicitly controlled here.
             let allowed = matches!(
@@ -1188,6 +1190,7 @@ fn validate_lock(
     temporary: Option<&Path>,
     selected: Option<&BTreeMap<String, Version>>,
 ) -> Result<()> {
+    let root = absolute(root)?;
     let text = std::str::from_utf8(bytes).context("uv.lock is not UTF-8")?;
     let document: DocumentMut = text
         .parse()
@@ -1231,8 +1234,14 @@ fn validate_lock(
     }
     let members = projects
         .iter()
-        .map(|p| {
-            absolute(&p.path).map(|p| p.parent().unwrap().strip_prefix(root).unwrap().to_owned())
+        .map(|project| {
+            let path = absolute(&project.path)?;
+            Ok(path
+                .parent()
+                .context("Lock project has no parent")?
+                .strip_prefix(&root)
+                .context("Lock project is outside the selected root")?
+                .to_owned())
         })
         .collect::<Result<BTreeSet<_>>>()?;
     let mut found = BTreeSet::new();
@@ -1416,6 +1425,32 @@ fn guarded_replace(path: &Path, before: &[u8], after: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_case_windows_resolver_overrides_are_not_ignored() {
+        const FLAG: &str = "CHECK_UPDATES_CASE_FIXTURE";
+        if std::env::var_os(FLAG).is_some() {
+            let error = controlled_environment(&mut Command::new("uv")).unwrap_err();
+            assert!(error.to_string().contains("resolver override"));
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "verification::tests::mixed_case_windows_resolver_overrides_are_not_ignored",
+            ])
+            .env(FLAG, "1")
+            .env("uv_resolution", "lowest")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn canonical_and_normal_project_paths_have_one_identity() {
