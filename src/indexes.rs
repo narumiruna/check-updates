@@ -660,7 +660,10 @@ fn cache_path_from(name: &str, xdg: Option<&OsStr>, home: Option<PathBuf>) -> Op
             home.filter(|path| path.is_absolute())
                 .map(|home| home.join(".cache"))
         })?;
-    let digest = format!("{:x}", Sha256::digest(normalize(name).as_bytes()));
+    let digest: String = Sha256::digest(normalize(name).as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     Some(root.join("check-updates").join(format!("v1-{digest}.json")))
 }
 
@@ -1440,14 +1443,10 @@ mod tests {
                 cache_path_from("demo-pkg", setting.map(OsStr::new), Some(home.clone()))
             );
             assert!(path.is_absolute());
-            assert!(
-                path.file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .starts_with("v1-")
+            assert_eq!(
+                path.file_name().unwrap(),
+                "v1-28b7c910e36c4f2cecd473867b3970ce142603a97488894aa391cba645d39e85.json"
             );
-            assert_eq!(path.file_name().unwrap().len(), 72);
         }
         let configured = temp.path().join("configured");
         assert_eq!(

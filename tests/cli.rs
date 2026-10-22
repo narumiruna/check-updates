@@ -164,6 +164,36 @@ fn json_contract_and_all_preview_modes_do_not_write() {
 }
 
 #[test]
+fn table_output_keeps_headers_rows_and_has_no_ansi_when_redirected() {
+    let original = "[project]\ndependencies=['demo>=1.0']\n";
+    let directory = project(original);
+    let index = IndexServer::new(&[("demo", &["2.0"])]);
+    let output = run(&directory, &index, &[]);
+    assert_code(&output, 0);
+    let table = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "Current requirement",
+        "Target",
+        "Change",
+        "Section",
+        "demo>=1.0",
+        "2.0",
+        "major",
+        "project.dependencies",
+        "1 dependency with updates in 1 file.",
+        "No files changed.",
+    ] {
+        assert!(table.contains(expected), "Missing {expected}: {table}");
+    }
+    assert!(table.contains('│'));
+    assert!(!table.contains('\x1b'));
+    assert_eq!(
+        fs::read_to_string(directory.path().join("pyproject.toml")).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn update_filters_keep_comments_crlf_markers_and_upper_bounds() {
     let original = "[project]\r\nrequires-python='>=3.10'\r\ndependencies = [\"demo[foo]>=1.0, <2; python_version < '3.14'\", 'other>=1.0'] # comment\r\n[dependency-groups]\r\nDev_Group = ['demo>=1.0', {include-group='other'}]\r\n";
     let directory = project(original);

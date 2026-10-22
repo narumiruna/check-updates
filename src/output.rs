@@ -38,7 +38,7 @@ pub fn show_updates(pending: &Pending, upgrade: bool, workspace: bool) {
         println!("{}:", safe_text(&project.path.to_string_lossy(), false));
         let mut table = Table::new();
         table
-            .load_preset(UTF8_FULL)
+            .load_style(UTF8_FULL)
             .set_content_arrangement(ContentArrangement::Dynamic);
         if let Ok((width, _)) = crossterm::terminal::size() {
             table.set_width(width.max(40));
