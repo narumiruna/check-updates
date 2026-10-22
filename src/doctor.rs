@@ -497,7 +497,10 @@ fn run_command(
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
-                if done.load(Ordering::Relaxed) {
+                // Drain buffered output after exit. Stopping immediately on
+                // `done` can lose a short JSON response written during sleep.
+                // The retention limit also bounds a daemon that keeps writing.
+                if done.load(Ordering::Relaxed) && retained.len() == OUTPUT_LIMIT {
                     break;
                 }
             }
@@ -581,6 +584,23 @@ fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn short_output_written_just_before_exit_is_fully_drained() {
+        for _ in 0..30 {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 0.009; printf '{\"version\":\"2.0\"}'"]);
+            let result = run_command(
+                &mut command,
+                Instant::now() + Duration::from_secs(2),
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(result.status.success());
+            assert_eq!(result._stdout, b"{\"version\":\"2.0\"}");
+        }
+    }
 
     #[test]
     fn individually_passing_updates_are_not_combined_without_testing() {
