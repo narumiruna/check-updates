@@ -1,5 +1,5 @@
 [package]
-name = "check-updates"
+name = "py-check-updates"
 version = "0.0.4"
 edition = "2024"
 rust-version = "1.92"
@@ -7,6 +7,13 @@ repository = "https://github.com/narumiruna/check-updates"
 description = "Check and update Python project dependencies"
 license = "MIT"
 readme = "README.md"
+
+[lib]
+name = "check_updates"
+
+[[bin]]
+name = "check-updates"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
