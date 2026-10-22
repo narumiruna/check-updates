@@ -33,7 +33,8 @@ type Metadata = (Vec<Release>, Option<String>);
 pub struct Release {
     pub version: Version,
     pub requires_python: Option<String>,
-    /// Artifact upload time in Unix UTC seconds, if the index provides a valid time.
+    /// Upload time in Unix UTC seconds, rounded up for fractional timestamps.
+    /// None means the index did not provide a valid time.
     pub uploaded: Option<i64>,
     pub yanked: bool,
 }
@@ -676,7 +677,9 @@ fn public_candidates(data: &Value, name: &str) -> Result<Metadata> {
 fn parse_upload_time(value: &str) -> Option<i64> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
-        .map(|timestamp| timestamp.unix_timestamp())
+        // Cutoffs have whole-second precision. Round upload times up so an
+        // artifact just after the cutoff cannot pass here and fail in uv.
+        .map(|timestamp| timestamp.unix_timestamp() + i64::from(timestamp.nanosecond() != 0))
 }
 
 fn upload_time(value: Option<&Value>) -> Option<i64> {
@@ -977,7 +980,8 @@ mod tests {
             ("1970-01-01T00:00:00Z", Some(0)),
             ("1970-01-01T01:00:01+01:00", Some(1)),
             ("1969-12-31T23:59:59Z", Some(-1)),
-            ("1970-01-01T00:00:02.123456Z", Some(2)),
+            ("1970-01-01T00:00:02.123456Z", Some(3)),
+            ("1969-12-31T23:59:59.5Z", Some(0)),
             ("9999-01-01T00:00:00Z", Some(253370764800)),
             ("1970-01-01T00:00:00", None),
             ("2026-02-30T00:00:00Z", None),
@@ -995,6 +999,28 @@ mod tests {
             public_upload_time(Some(&json!("1970-01-01T00:00:03"))),
             Some(3)
         );
+    }
+
+    #[test]
+    fn fractional_upload_times_cannot_cross_the_inclusive_cooldown_boundary() {
+        for (timestamp, eligible) in [
+            ("1970-01-01T00:00:02Z", true),
+            ("1970-01-01T00:00:02.000001Z", false),
+            ("1970-01-01T00:00:01.999999Z", true),
+        ] {
+            let data =
+                json!({"files":[{"filename":"demo-2-py3-none-any.whl","upload-time":timestamp}]});
+            let releases =
+                simple_candidates_metadata(data.to_string().as_bytes(), "application/json", "demo")
+                    .unwrap();
+            let policy = crate::selection::CandidatePolicy {
+                cutoff: Some(2),
+                ..Default::default()
+            };
+            let decision =
+                crate::selection::evaluate(&"demo>=1".parse().unwrap(), &releases, &policy, None);
+            assert_eq!(decision.selected.is_some(), eligible, "{timestamp}");
+        }
     }
 
     #[test]
