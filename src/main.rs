@@ -16,6 +16,7 @@ use check_updates::{
 
 #[derive(Debug, Parser)]
 #[command(
+    name = "check-updates",
     version,
     about = "Check stable Python releases; lock existing uv projects after updates, without installing packages."
 )]

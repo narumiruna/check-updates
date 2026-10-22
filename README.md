@@ -6,6 +6,8 @@ Run with `uvx`, provided by [`uv`](https://docs.astral.sh/uv/getting-started/ins
 
 ## Installation
 
+The Cargo package name is `py-check-updates`. The PyPI package name and installed command remain `check-updates`.
+
 The command remains available through PyPI. Maturin packages the Rust executable as a platform wheel; there are no Python application dependencies.
 
 ```sh
