@@ -3,8 +3,8 @@
 use anyhow::{Result, anyhow, bail};
 use pep440_rs::Version;
 use percent_encoding::percent_decode_str;
-use reqwest::blocking::{Client, ClientBuilder, Request};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::{Client, ClientBuilder, Request};
 use scraper::{Html, Selector};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -12,9 +12,12 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::LazyLock;
-use std::thread;
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::runtime::{Builder, Runtime};
 use url::Url;
 
 const CACHE_TTL: f64 = 3600.0;
@@ -224,14 +227,26 @@ fn client_builder() -> ClientBuilder {
 enum ReadError {
     Http(u16),
     Network,
+    Interrupted,
 }
 
 pub struct ReleaseClient {
     no_cache: bool,
     http: Client,
+    runtime: Option<Runtime>,
     cache: HashMap<CacheKey, Vec<Release>>,
     links: HashMap<CacheKey, String>,
     notes: HashMap<String, String>,
+}
+
+impl Drop for ReleaseClient {
+    fn drop(&mut self) {
+        // A cancelled DNS lookup can still have a blocking resolver task.
+        // Do not wait for that task when the CLI needs to exit.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 impl ReleaseClient {
@@ -241,58 +256,98 @@ impl ReleaseClient {
             http: client_builder()
                 .build()
                 .map_err(|_| anyhow!("Could not initialize metadata HTTP client."))?,
+            runtime: Some(
+                Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| anyhow!("Could not initialize metadata runtime."))?,
+            ),
             cache: HashMap::new(),
             links: HashMap::new(),
             notes: HashMap::new(),
         })
     }
 
-    fn read(&self, request: Request) -> std::result::Result<(Vec<u8>, String), ReadError> {
-        for attempt in 0..3 {
-            let result = match self.http.execute(
-                request
-                    .try_clone()
-                    .expect("metadata GET request is cloneable"),
-            ) {
-                Ok(response) => {
-                    let status = response.status();
-                    if !status.is_success() {
-                        Err(ReadError::Http(status.as_u16()))
-                    } else {
-                        let content_type = response
-                            .headers()
-                            .get(CONTENT_TYPE)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or("")
-                            .to_owned();
-                        response
-                            .bytes()
-                            .map(|body| (body.to_vec(), content_type))
-                            .map_err(|_| ReadError::Network)
-                    }
+    fn read(
+        &self,
+        request: Request,
+        interrupted: &AtomicBool,
+    ) -> std::result::Result<(Vec<u8>, String), ReadError> {
+        let lookup = async {
+            for attempt in 0..3 {
+                if interrupted.load(Ordering::Relaxed) {
+                    return Err(ReadError::Interrupted);
                 }
-                Err(_) => Err(ReadError::Network),
-            };
-            let retry = matches!(
-                result,
-                Err(ReadError::Network | ReadError::Http(408 | 429 | 500 | 502 | 503 | 504))
-            );
-            if !retry || attempt == 2 {
-                return result;
+                let result = match self
+                    .http
+                    .execute(
+                        request
+                            .try_clone()
+                            .expect("metadata GET request is cloneable"),
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        let status = response.status();
+                        if !status.is_success() {
+                            Err(ReadError::Http(status.as_u16()))
+                        } else {
+                            let content_type = response
+                                .headers()
+                                .get(CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("")
+                                .to_owned();
+                            response
+                                .bytes()
+                                .await
+                                .map(|body| (body.to_vec(), content_type))
+                                .map_err(|_| ReadError::Network)
+                        }
+                    }
+                    Err(_) => Err(ReadError::Network),
+                };
+                let retry = matches!(
+                    result,
+                    Err(ReadError::Network | ReadError::Http(408 | 429 | 500 | 502 | 503 | 504))
+                );
+                if !retry || attempt == 2 {
+                    return result;
+                }
+                tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
             }
-            thread::sleep(Duration::from_millis(250 * (attempt + 1)));
-        }
-        unreachable!("bounded metadata retry loop")
+            unreachable!("bounded metadata retry loop")
+        };
+        self.runtime
+            .as_ref()
+            .expect("metadata runtime is available")
+            .block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        while !interrupted.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    } => Err(ReadError::Interrupted),
+                    result = lookup => result,
+                }
+            })
     }
 
-    fn private(&self, name: &str, indexes: &[Index]) -> Result<Option<(Vec<Release>, String)>> {
+    fn private(
+        &self,
+        name: &str,
+        indexes: &[Index],
+        interrupted: &AtomicBool,
+    ) -> Result<Option<(Vec<Release>, String)>> {
         for index in indexes {
             if index.explicit {
                 continue;
             }
             let (request, link) = index.request(name, &self.http)?;
-            let (body, content_type) = match self.read(request) {
+            let (body, content_type) = match self.read(request, interrupted) {
                 Ok(response) => response,
+                Err(ReadError::Interrupted) => return Err(crate::Interrupted.into()),
                 Err(ReadError::Http(404)) => continue,
                 Err(ReadError::Http(code)) => {
                     bail!("Index lookup failed for {name} (HTTP {code}).")
@@ -322,6 +377,16 @@ impl ReleaseClient {
         url: &str,
         path: Option<PathBuf>,
     ) -> Result<Vec<Release>> {
+        self.public_from_with_interrupt(name, url, path, &crate::INTERRUPTED)
+    }
+
+    fn public_from_with_interrupt(
+        &mut self,
+        name: &str,
+        url: &str,
+        path: Option<PathBuf>,
+        interrupted: &AtomicBool,
+    ) -> Result<Vec<Release>> {
         if !self.no_cache
             && let Some((releases, note)) = path.as_ref().and_then(|p| load_cache(p, now()))
         {
@@ -335,8 +400,9 @@ impl ReleaseClient {
             .get(url)
             .build()
             .map_err(|_| anyhow!("Invalid public PyPI URL."))?;
-        let (body, _) = match self.read(request) {
+        let (body, _) = match self.read(request, interrupted) {
             Ok(response) => response,
+            Err(ReadError::Interrupted) => return Err(crate::Interrupted.into()),
             Err(ReadError::Http(404)) => bail!(
                 "Package {name} was not found on public PyPI (HTTP 404). Check the package name; it may be private or unpublished. Use --index or configure tool.uv.index for private packages. For uv workspace dependencies, declare workspace = true in [tool.uv.sources] and use -w to include workspace root sources and check members. No files were written."
             ),
@@ -376,7 +442,9 @@ impl ReleaseClient {
         if let Some(releases) = self.cache.get(&key) {
             return Ok(releases.clone());
         }
-        let (releases, link) = if let Some(found) = self.private(&name, indexes)? {
+        let (releases, link) = if let Some(found) =
+            self.private(&name, indexes, &crate::INTERRUPTED)?
+        {
             found
         } else {
             if indexes.iter().any(|index| index.default) {
@@ -634,7 +702,7 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
-    use std::thread::JoinHandle;
+    use std::thread::{self, JoinHandle};
 
     // Local TCP fixtures keep HTTP, redirect, and truncated-body tests offline.
     struct Server {
@@ -738,6 +806,102 @@ mod tests {
         Release {
             version: version.parse().unwrap(),
             requires_python: python.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn client_shutdown_does_not_wait_for_a_blocking_resolver() {
+        let client = client(true);
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = client.runtime.as_ref().unwrap().spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = std::time::Instant::now();
+        drop(client);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+        // The blocking task can finish after the runtime has stopped.
+        drop(worker);
+    }
+
+    #[test]
+    fn cancellation_before_dispatch_preserves_interrupted_error() {
+        let server = Server::new(|_| vec![response(503, "text/plain", "private body")]);
+        let fallback = Server::new(|_| vec![response(200, "application/json", r#"{"files": []}"#)]);
+        let interrupted = AtomicBool::new(true);
+        let mut client = client(false);
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache.json");
+        let private_error = client
+            .private(
+                "demo",
+                &[index(&server.url), index(&fallback.url)],
+                &interrupted,
+            )
+            .unwrap_err();
+        assert!(private_error.downcast_ref::<crate::Interrupted>().is_some());
+        let public_error = client
+            .public_from_with_interrupt("demo", &server.url, Some(cache.clone()), &interrupted)
+            .unwrap_err();
+        assert!(public_error.downcast_ref::<crate::Interrupted>().is_some());
+        assert_eq!(server.count(), 0);
+        assert_eq!(fallback.count(), 0);
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn cancellation_during_backoff_stops_retries_and_index_fallback() {
+        for public in [false, true] {
+            let server = Server::new(|_| vec![response(503, "text/plain", "private body")]);
+            let fallback =
+                Server::new(|_| vec![response(200, "application/json", r#"{"files": []}"#)]);
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let flag = interrupted.clone();
+            let requests = server.requests.clone();
+            let trigger = thread::spawn(move || {
+                let started = std::time::Instant::now();
+                while requests.lock().unwrap().is_empty() {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "request did not start"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                thread::sleep(Duration::from_millis(40));
+                flag.store(true, Ordering::Relaxed);
+            });
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache.json");
+            let mut client = client(false);
+            let started = std::time::Instant::now();
+            let error = if public {
+                client
+                    .public_from_with_interrupt(
+                        "demo",
+                        &server.url,
+                        Some(cache.clone()),
+                        &interrupted,
+                    )
+                    .unwrap_err()
+            } else {
+                client
+                    .private(
+                        "demo",
+                        &[index(&server.url), index(&fallback.url)],
+                        &interrupted,
+                    )
+                    .unwrap_err()
+            };
+            trigger.join().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(error.downcast_ref::<crate::Interrupted>().is_some());
+            assert_eq!(error.to_string(), "Interrupted.");
+            assert_eq!(server.count(), 1);
+            assert_eq!(fallback.count(), 0);
+            assert!(!cache.exists());
         }
     }
 
@@ -1191,7 +1355,10 @@ mod tests {
             .basic_auth("user", Some("secret"))
             .build()
             .unwrap();
-        assert_eq!(client.read(request).unwrap().0, b"done");
+        assert_eq!(
+            client.read(request, &AtomicBool::new(false)).unwrap().0,
+            b"done"
+        );
         assert_eq!(server.count(), 2);
         for request in server.requests.lock().unwrap().iter() {
             assert!(
