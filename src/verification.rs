@@ -116,9 +116,10 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     }
     // Existing paths must have one representation on Windows: canonical paths
     // use a verbatim prefix while current_dir can return a normal drive path.
+    // dunce simplifies ordinary prefixes without changing special UNC names.
     // Reject links first so canonicalization cannot hide unsupported inputs.
     no_symlink_components(&normalized)?;
-    match fs::canonicalize(&normalized) {
+    match dunce::canonicalize(&normalized) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(normalized),
         Err(error) => Err(error).context("Cannot resolve verification input path"),
@@ -672,7 +673,7 @@ fn local_artifact_directories(projects: &[Project]) -> Result<BTreeSet<PathBuf>>
         {
             for link in links {
                 if let Some(path) = link.as_str().filter(|s| Path::new(s).is_absolute()) {
-                    directories.insert(PathBuf::from(path));
+                    directories.insert(absolute(Path::new(path))?);
                 }
             }
         }
@@ -1204,18 +1205,25 @@ fn validate_lock(
     if let Some(temporary) = temporary {
         let native = temporary.to_string_lossy();
         let forward = native.replace('\\', "/");
+        let simplified = dunce::simplified(temporary).to_string_lossy();
+        let simplified_forward = simplified.replace('\\', "/");
         let encoded = url::Url::from_directory_path(temporary)
             .ok()
             .map(|u| u.to_string());
         ensure!(
             !text.contains(native.as_ref())
                 && !text.contains(&forward)
+                && !text.contains(simplified.as_ref())
+                && !text.contains(&simplified_forward)
                 && !encoded.as_ref().is_some_and(|path| text.contains(path)),
             "Resolved lockfile contains temporary workspace paths and cannot be applied"
         );
         item_strings(document.as_item(), &mut |value| {
             ensure!(
-                !value.contains(native.as_ref()) && !value.contains(&forward),
+                !value.contains(native.as_ref())
+                    && !value.contains(&forward)
+                    && !value.contains(simplified.as_ref())
+                    && !value.contains(&simplified_forward),
                 "Resolved lockfile contains temporary paths"
             );
             Ok(())
@@ -1264,7 +1272,7 @@ fn validate_lock(
             );
             if temporary.is_some() && Path::new(registry).is_absolute() {
                 ensure!(
-                    local_directories.contains(Path::new(registry)),
+                    local_directories.contains(&absolute(Path::new(registry))?),
                     "Resolved lock references an unverified local artifact directory"
                 );
             }
@@ -1430,6 +1438,26 @@ mod tests {
     }
 
     #[test]
+    fn configured_and_locked_artifact_directories_have_one_identity() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let wheels = temp.path().join("wheels");
+        fs::create_dir(&wheels).unwrap();
+        let canonical = wheels.canonicalize().unwrap();
+        let text = format!(
+            "[project]\nname='fixture'\nversion='1'\n[tool.uv]\nfind-links=[{}]\n",
+            Value::from(canonical.to_str().unwrap())
+        );
+        let project = Project {
+            path: temp.path().join("pyproject.toml"),
+            document: text.parse().unwrap(),
+            original: text.into_bytes(),
+        };
+        let directories = local_artifact_directories(&[project]).unwrap();
+        assert!(directories.contains(&absolute(&canonical).unwrap()));
+        assert!(directories.contains(&absolute(dunce::simplified(&canonical)).unwrap()));
+    }
+
+    #[test]
     fn only_first_index_strategy_matches_metadata_routing() {
         for (strategy, valid) in [
             ("first-index", true),
@@ -1492,7 +1520,7 @@ mod tests {
 
     fn result_fixture() -> (TempDir, Project, Verified) {
         let original = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let root = original.path().to_owned();
+        let root = absolute(original.path()).unwrap();
         let path = root.join("pyproject.toml");
         fs::write(&path, "[project]\nname='fixture'\nversion='1'\n").unwrap();
         fs::write(root.join("uv.lock"), "original lock").unwrap();

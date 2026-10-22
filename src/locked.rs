@@ -157,7 +157,16 @@ pub fn inspect(root: &Path, name: &str, indexes: &[Index]) -> Value {
             unknown = true;
             continue;
         }
-        let Some(registry) = registry.as_str().and_then(registry_identity) else {
+        let Some(registry) = registry.as_str() else {
+            return report("malformed", Vec::new());
+        };
+        if Path::new(registry).is_absolute() {
+            // uv also uses registry for absolute find-links directories. They
+            // are valid lock records, but not HTTP index identities.
+            unknown = true;
+            continue;
+        }
+        let Some(registry) = registry_identity(registry) else {
             return report("malformed", Vec::new());
         };
         let Some(version) = package.get("version").and_then(Item::as_str) else {
@@ -212,6 +221,16 @@ mod tests {
         assert_eq!(result["freshness"], "not_checked");
         assert_eq!(fs::read(temp.path().join("uv.lock")).unwrap(), before);
         result
+    }
+
+    #[test]
+    fn local_wheel_registry_is_unknown_not_malformed() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = format!(
+            "version=1\nrevision=5\n{}",
+            package("2", temp.path().to_str().unwrap(), &[])
+        );
+        assert_eq!(fixture(&text, &[PYPI]), report("unknown", vec![]));
     }
 
     #[test]
