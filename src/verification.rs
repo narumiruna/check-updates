@@ -114,7 +114,15 @@ fn absolute(path: &Path) -> Result<PathBuf> {
             part => normalized.push(part.as_os_str()),
         }
     }
-    Ok(normalized)
+    // Existing paths must have one representation on Windows: canonical paths
+    // use a verbatim prefix while current_dir can return a normal drive path.
+    // Reject links first so canonicalization cannot hide unsupported inputs.
+    no_symlink_components(&normalized)?;
+    match fs::canonicalize(&normalized) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(normalized),
+        Err(error) => Err(error).context("Cannot resolve verification input path"),
+    }
 }
 
 fn no_symlink_components(path: &Path) -> Result<()> {
@@ -1400,6 +1408,26 @@ fn guarded_replace(path: &Path, before: &[u8], after: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_and_normal_project_paths_have_one_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().canonicalize().unwrap();
+        let manifest = directory.join("pyproject.toml");
+        fs::write(&manifest, "[project]\nname='fixture'\n").unwrap();
+        #[cfg(windows)]
+        let normal = temp.path().join("pyproject.toml");
+        #[cfg(not(windows))]
+        let normal = manifest.clone();
+        assert_eq!(
+            absolute(&normal).unwrap(),
+            absolute(&manifest.canonicalize().unwrap()).unwrap()
+        );
+        assert_eq!(
+            absolute(&directory).unwrap(),
+            absolute(&directory.canonicalize().unwrap()).unwrap()
+        );
+    }
 
     #[test]
     fn only_first_index_strategy_matches_metadata_routing() {

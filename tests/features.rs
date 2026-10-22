@@ -667,7 +667,11 @@ fn bound_writes_require_successful_verification_and_leave_files_unchanged_on_fai
         .output()
         .unwrap();
     assert_code(&output, 1);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("existing regular uv.lock"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("existing regular uv.lock"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     unchanged(&directory, &original);
 }
 
@@ -997,7 +1001,11 @@ fn verify_missing_lock_and_unavailable_uv_fail_without_mutation() {
         .output()
         .unwrap();
     assert_code(&output, 1);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("existing regular uv.lock"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("existing regular uv.lock"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     unchanged(&directory, &original);
     let lock = "version=1\nrevision=3\n[[package]]\nname='fixture'\nversion='0.0.0'\nsource={virtual='.'}\n";
     fs::write(directory.path().join("uv.lock"), lock).unwrap();
