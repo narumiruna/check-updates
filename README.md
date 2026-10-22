@@ -1,8 +1,28 @@
 # check-updates
 
-Check Python dependencies in `pyproject.toml` for newer stable releases on PyPI or configured package indexes, then choose which updates to apply.
+A native Rust CLI that checks Python dependencies in `pyproject.toml` for newer stable releases on PyPI or configured package indexes, then lets you choose which updates to apply.
 
 Run with `uvx`, provided by [`uv`](https://docs.astral.sh/uv/getting-started/installation/), without installing check-updates into your project environment. After writing dependency updates, the tool runs `uv lock` if the selected project root already has `uv.lock`. Use `--no-lock` with `-u` or `-i` to update requirements only. The tool does not install packages or run `uv sync`.
+
+## Installation
+
+The command remains available through PyPI. Maturin packages the Rust executable as a platform wheel; there are no Python application dependencies.
+
+```sh
+# Run without installing into the project.
+uvx check-updates
+
+# Install a persistent command.
+uv tool install check-updates
+
+# Or use pip.
+pip install check-updates
+
+# Install directly with Cargo, without Python.
+cargo install --path . --locked
+```
+
+Release builds produce wheels for Linux (glibc 2.28 or newer, x86-64 and ARM64), macOS (Intel and Apple Silicon), and Windows (x86-64). Wheels do not require Rust. Installation from a source distribution requires a Rust toolchain and a C compiler. PyPI installation requires Python 3.10 or newer; the installed executable does not use Python at runtime.
 
 ## Quick start
 
@@ -40,7 +60,8 @@ Review the requirement and lockfile changes and test your project after updating
 | `--diff` | Show a read-only unified diff without a table |
 | `--index URL` | Use a Simple index; repeat in first-match priority order |
 | `--no-cache` | Bypass persistent public PyPI cache reads and writes |
-| `--debug` | Write detailed diagnostics and error tracebacks to stderr |
+| `--debug` | Write diagnostic messages and error context to stderr |
+| `--version` | Show the native CLI version |
 | `--help` | Show command help |
 
 `-i` and `-u` cannot be combined. Both can be used with `-w` and selection options. `--check`, `--diff`, and `--format json` cannot be combined with `-i` or `-u`. `--check` can accompany JSON or diff output; JSON and diff cannot be combined. Without `-i` or `-u`, no project files are changed.
@@ -96,7 +117,7 @@ JSON stdout is one object with `schema_version: 1` and an `updates` array. Each 
 
 ### Debug diagnostics
 
-Add `--debug` to any mode to trace project discovery, workspace member selection, dependency checks and skip reasons, PyPI requests and release filtering, cache hits, update decisions, interactive selection and confirmation, and file writes. Errors include tracebacks. Normal stdout output and exit codes are unchanged.
+Add `--debug` to trace project discovery, dependency checks, and update decisions. Errors include context, not Python tracebacks. Normal stdout output and exit codes are unchanged.
 
 ```sh
 uvx check-updates --debug -w 2>debug.log
@@ -223,7 +244,7 @@ For named indexes, supply HTTP Basic credentials using `UV_INDEX_INTERNAL_USERNA
 
 Authenticated requests require HTTPS. Explicit ports must be between `1` and `65535`; port `0` is rejected before a request. URLs with queries or fragments are rejected. Cross-origin redirects and HTTPS downgrades are rejected; same-origin redirects retain authentication.
 
-Index errors and debug tracebacks do not expose credentials or private response bodies. Output links omit URL userinfo. Paths and package names can still be sensitive. Private-index metadata is kept only in memory for the invocation and is never written to disk.
+Index errors and diagnostic messages do not expose credentials or private response bodies. Output links omit URL userinfo. Paths and package names can still be sensitive. Private-index metadata is kept only in memory for the invocation and is never written to disk.
 
 A public PyPI 404 stops the check with a message naming the package and suggesting checks for misspellings, private or unpublished packages, and workspace configuration. No files are written when a lookup fails.
 
@@ -247,16 +268,22 @@ All requirement-file reads and index lookups finish before writing, so lookup fa
 
 ## Development
 
-Set up the development environment from the repository:
+Install Rust 1.92 or newer and uv. The CLI implementation and tests are Rust; uv is used to build and test PyPI distributions.
 
 ```sh
-uv sync --frozen
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo run -- --help
+cargo build --release --locked
+
+# Build a source distribution and a local platform wheel.
+uv build
+
+# Test the wheel without reading PyPI.
+uvx --isolated --no-index --find-links dist check-updates --version
 ```
 
-Run checks without updating the environment or lock file:
+`Cargo.toml` is the version source. `pyproject.toml` reads the version through maturin. Keep `Cargo.lock` and `uv.lock` in version control. The publish workflow builds and tests each platform wheel before publication. Cross-platform builds must pass in CI before release.
 
-```sh
-uv run --frozen --no-sync pytest
-uv run --frozen --no-sync ruff check .
-uv run --frozen --no-sync ty check .
-```
+The Docker image contains the native CLI and uv for automatic locking. It does not require Python to run the CLI. Source installs and `uv build` compile Rust; platform wheel installs do not.

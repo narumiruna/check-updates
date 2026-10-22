@@ -1,87 +1,37 @@
 [project]
-name            = "check-updates"
-version         = "0.0.4"
-description     = ""
-readme          = "README.md"
+name = "check-updates"
+dynamic = ["version"]
+description = "Check and update Python project dependencies with a native Rust CLI"
+readme = "README.md"
 requires-python = ">=3.10"
-authors         = [{ name = "narumi", email = "toucans-cutouts0f@icloud.com" }]
-dependencies    = [
-  "packaging>=26.3",
-  "prompt-toolkit>=3.0.53,<4",
-  "rich>=15.0.0",
-  "tomlkit>=0.15.1",
-  "typer>=0.27.3",
-]
-
-[project.scripts]
-check-updates = "check_updates.cli:app"
-
-[dependency-groups]
-dev = [
-  "pytest>=9.1.1",
-  "pytest-cov>=7.1.0",
-  "ruff>=0.17.1",
-  "ty>=0.0.88",
-]
+license = "MIT"
+authors = [{ name = "narumi", email = "toucans-cutouts0f@icloud.com" }]
+dependencies = []
 
 [build-system]
-requires      = ["uv_build>=0.13.1,<0.14.0"]
-build-backend = "uv_build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
-[tool.bumpversion]
-current_version  = "0.0.4"
-tag              = true
-commit           = true
-pre_commit_hooks = ["uv lock", "git add uv.lock"]
+[tool.maturin]
+bindings = "bin"
+manifest-path = "Cargo.toml"
+strip = true
 
-[tool.pytest]
-filterwarnings = ["ignore::DeprecationWarning"]
-
-[tool.ruff]
-line-length = 120
-
-[tool.ruff.lint]
-select = [
-  "ANN",     # flake8-annotations
-  "ASYNC",   # flake8-async
-  "B",       # flake8-bugbear
-  "BLE",     # flake8-blind-except
-  "C",       # flake8-comprehensions
-  "DTZ",     # flake8-datetimez
-  "E",       # pycodestyle errors
-  "F",       # pyflakes
-  "FURB",    # refurb
-  "I",       # isort
-  "G",       # flake8-logging-format
-  "N",       # pep8-naming
-  "PERF",    # perflint
-  "PIE",     # flake8-pie
-  "PTH",     # flake8-use-pathlib
-  "RET",     # flake8-return
-  "RSE",     # flake8-raise
-  "RUF",     # ruff-specific rules
-  "SIM",     # flake8-simplify
-  "TID",     # flake8-tidy-imports
-  "TRY002",  # raise-vanilla-class
-  "TRY004",  # type-check-without-type-error
-  "TRY203",  # useless-try-except
-  "TRY300",  # try-consider-else
-  "UP",      # pyupgrade
-  "W",       # pycodestyle warnings
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "Cargo.lock" },
+  { file = "src/**/*.rs" },
 ]
 
-[tool.ruff.lint.per-file-ignores]
-"tests/**.py" = ["ANN", "TRY", "PERF"]
+[tool.bumpversion]
+current_version = "0.0.4"
+tag = true
+commit = true
+pre_commit_hooks = ["cargo update --workspace", "uv lock", "git add Cargo.lock uv.lock"]
 
-[tool.ruff.lint.isort]
-force-single-line = true
-
-[tool.tombi.files]
-exclude = ["uv.lock"]
-
-[tool.tombi.format.rules]
-key-value-equals-sign-alignment = true
-trailing-comment-alignment      = true
-
-[tool.ty.rules]
-unresolved-import = "ignore"
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'

@@ -1,28 +1,13 @@
-# https://docs.astral.sh/uv/guides/integration/docker/#non-editable-installs
-ARG PYTHON_VERSION=3.14
-ARG DEBIAN_VERSION=bookworm
-FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-${DEBIAN_VERSION}-slim AS uv
-
+FROM rust:1.92-bookworm AS builder
 WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked
 
-ENV UV_COMPILE_BYTECODE=1
-ENV UV_LINK_MODE=copy
-
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --no-dev --no-editable
-
-ADD . /app
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
-
-FROM python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION}
-
+FROM debian:bookworm-slim
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=builder /app/target/release/check-updates /usr/local/bin/check-updates
 WORKDIR /app
-
-COPY --from=uv --chown=app:app /app/.venv /app/.venv
-
-ENV PATH="/app/.venv/bin:$PATH"
-
 ENTRYPOINT ["check-updates"]

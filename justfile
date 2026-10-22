@@ -1,23 +1,22 @@
 [default]
-all: format lint type test
+all: format lint test
 
-# Format code using ruff
 format:
-    uv run ruff format
+    cargo fmt --check
 
-# Lint code using ruff
 lint:
-    uv run ruff check --fix
+    cargo clippy --all-targets --locked -- -D warnings
 
-# Type checking using ty
-type:
-    uv run ty check
-
-# Run tests using pytest with coverage
 test:
-    uv run pytest -v -s --cov=src tests
+    cargo test --locked
 
-# Build and publish the package to PyPI
-publish:
+build:
+    cargo build --release --locked
+
+# Build a local platform wheel and source distribution.
+package:
     uv build
+
+# Publish previously built distributions.
+publish:
     uv publish
