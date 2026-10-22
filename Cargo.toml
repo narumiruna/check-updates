@@ -30,7 +30,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 scraper = "0.24"
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
-similar = "2"
+similar = "3"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 toml_edit = "0.25"
 url = "2"
