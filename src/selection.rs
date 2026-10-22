@@ -3,9 +3,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use pep440_rs::{Operator, Version, VersionSpecifier, VersionSpecifiers};
 use pep508_rs::Requirement;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::dependencies::{Dependency, baseline, normalize, specifiers};
+use crate::dependencies::{Dependency, baseline, normalize, specifiers, unsupported_reason};
 use crate::indexes::Release;
 
 #[derive(Clone, Debug)]
@@ -84,6 +84,17 @@ fn specifiers_contain(specs: &VersionSpecifiers, version: &Version) -> bool {
     specs.iter().all(|spec| specifier_contains(spec, version))
 }
 
+/// Match the full declared range, including compatible bounds and exclusions.
+/// URL requirements do not describe a version range.
+pub fn requirement_contains(requirement: &Requirement, version: &Version) -> bool {
+    !matches!(
+        requirement.version_or_url,
+        Some(pep508_rs::VersionOrUrl::Url(_))
+    ) && specifiers(requirement)
+        .iter()
+        .all(|spec| specifier_contains(spec, version))
+}
+
 /// Use the declared inclusive Python floor. Never use the host interpreter.
 pub fn python_baseline(value: Option<&str>) -> Result<Option<Version>> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
@@ -130,69 +141,223 @@ pub fn python_baseline(value: Option<&str>) -> Result<Option<Version>> {
     Ok(Some(floor.clone()))
 }
 
-/// Pick the highest newer release allowed by bounds, target, and Python metadata.
-/// Release discovery supplies stable, non-yanked releases.
+/// Candidate filters. A cutoff is an inclusive Unix timestamp in seconds.
+#[derive(Clone, Debug)]
+pub struct CandidatePolicy {
+    pub target: String,
+    pub cutoff: Option<i64>,
+    pub allow_prerelease: bool,
+    pub minimal: bool,
+    pub exact: Option<Version>,
+}
+
+impl Default for CandidatePolicy {
+    fn default() -> Self {
+        Self {
+            target: "latest".into(),
+            cutoff: None,
+            allow_prerelease: false,
+            minimal: false,
+            exact: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Decision {
+    pub selected: Option<Version>,
+    /// Highest observed stable, non-yanked version, before policy filters.
+    pub latest: Option<Version>,
+    /// Highest observed non-yanked alpha, beta, or RC version, excluding dev releases.
+    pub prerelease: Option<Version>,
+    /// Rejected newer versions, highest first, with all artifact rejection codes.
+    pub rejected: Vec<(Version, Vec<&'static str>)>,
+    /// Summary code when no requirement change is selected.
+    pub reason: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Rejection {
+    UpperBound,
+    Excluded,
+    Target,
+    Python,
+    Prerelease,
+    Development,
+    Yanked,
+    Cooldown,
+    UnknownUploadTime,
+    LocalVersion,
+    ExactTarget,
+}
+
+impl Rejection {
+    fn code(self) -> &'static str {
+        match self {
+            Self::UpperBound => "upper_bound",
+            Self::Excluded => "excluded",
+            Self::Target => "target",
+            Self::Python => "python",
+            Self::Prerelease => "prerelease",
+            Self::Development => "development",
+            Self::Yanked => "yanked",
+            Self::Cooldown => "cooldown",
+            Self::UnknownUploadTime => "unknown_upload_time",
+            Self::LocalVersion => "local_version",
+            Self::ExactTarget => "exact_target",
+        }
+    }
+}
+
+/// Evaluate newer versions without resolving dependencies.
+/// A version qualifies only if one artifact passes every active filter.
+/// With prereleases enabled, PEP 440 ordering selects the highest candidate;
+/// a final release takes precedence over its own prereleases, not newer RCs.
+pub fn evaluate(
+    requirement: &Requirement,
+    releases: &[Release],
+    policy: &CandidatePolicy,
+    python: Option<&Version>,
+) -> Decision {
+    let mut decision = Decision {
+        selected: None,
+        latest: releases
+            .iter()
+            .filter(|release| !release.yanked && !release.version.any_prerelease())
+            .map(|release| &release.version)
+            .max()
+            .cloned(),
+        prerelease: releases
+            .iter()
+            .filter(|release| {
+                !release.yanked && release.version.is_pre() && !release.version.is_dev()
+            })
+            .map(|release| &release.version)
+            .max()
+            .cloned(),
+        rejected: Vec::new(),
+        reason: None,
+    };
+    if unsupported_reason(requirement).is_some() {
+        decision.reason = Some("unsupported_requirement");
+        return decision;
+    }
+    let spec = baseline(requirement);
+    let before = spec.map(|spec| spec.version());
+    let mut versions: BTreeMap<&Version, Vec<&Release>> = BTreeMap::new();
+    for release in releases {
+        if before.is_none_or(|before| &release.version > before) {
+            versions.entry(&release.version).or_default().push(release);
+        }
+    }
+    for (version, artifacts) in versions.into_iter().rev() {
+        let mut shared = BTreeSet::new();
+        for spec in specifiers(requirement) {
+            let reason = match spec.operator() {
+                Operator::LessThan | Operator::LessThanEqual => Rejection::UpperBound,
+                Operator::NotEqual | Operator::NotEqualStar => Rejection::Excluded,
+                _ => continue,
+            };
+            if !specifier_contains(spec, version) {
+                shared.insert(reason);
+            }
+        }
+        if policy.target != "latest" {
+            let width = if policy.target == "patch" { 2 } else { 1 };
+            if before.is_none_or(|before| {
+                before.epoch() != version.epoch()
+                    || (0..width).any(|index| {
+                        before.release().get(index).copied().unwrap_or(0)
+                            != version.release().get(index).copied().unwrap_or(0)
+                    })
+            }) {
+                shared.insert(Rejection::Target);
+            }
+        }
+        if version.is_pre() && !policy.allow_prerelease {
+            shared.insert(Rejection::Prerelease);
+        }
+        if version.is_dev() {
+            shared.insert(Rejection::Development);
+        }
+        if version.is_local() && spec.is_none_or(|spec| *spec.operator() != Operator::Equal) {
+            shared.insert(Rejection::LocalVersion);
+        }
+        if policy.exact.as_ref().is_some_and(|exact| exact != version) {
+            shared.insert(Rejection::ExactTarget);
+        }
+        let mut rejected = BTreeSet::new();
+        let mut eligible = false;
+        for artifact in artifacts {
+            let mut reasons = shared.clone();
+            if artifact.yanked {
+                reasons.insert(Rejection::Yanked);
+            }
+            if let (Some(python), Some(metadata)) = (python, &artifact.requires_python)
+                && !metadata.is_empty()
+                && !metadata
+                    .parse::<VersionSpecifiers>()
+                    .is_ok_and(|specs| specifiers_contain(&specs, python))
+            {
+                reasons.insert(Rejection::Python);
+            }
+            if let Some(cutoff) = policy.cutoff {
+                match artifact.uploaded {
+                    Some(uploaded) if uploaded > cutoff => {
+                        reasons.insert(Rejection::Cooldown);
+                    }
+                    None => {
+                        reasons.insert(Rejection::UnknownUploadTime);
+                    }
+                    _ => {}
+                }
+            }
+            eligible |= reasons.is_empty();
+            rejected.extend(reasons);
+        }
+        if eligible {
+            if decision.selected.is_none() {
+                decision.selected = Some(version.clone());
+            }
+        } else {
+            decision.rejected.push((
+                version.clone(),
+                rejected.into_iter().map(Rejection::code).collect(),
+            ));
+        }
+    }
+    if let Some(selected) = &decision.selected {
+        if policy.minimal && requirement_contains(requirement, selected) {
+            decision.selected = None;
+            decision.reason = Some("minimal");
+        }
+    } else {
+        decision.reason = Some(if decision.rejected.is_empty() {
+            "no_newer_release"
+        } else {
+            "blocked"
+        });
+    }
+    decision
+}
+
+/// Pick the highest newer stable release with the default candidate policy.
 pub fn choose_version(
     requirement: &Requirement,
     releases: &[Release],
     target: &str,
     python: Option<&Version>,
 ) -> Option<Version> {
-    let spec = baseline(requirement);
-    let before = spec.map(|spec| spec.version());
-    releases
-        .iter()
-        .filter(|release| {
-            let version = &release.version;
-            if before.is_some_and(|before| version <= before)
-                || (version.is_local()
-                    && spec.is_none_or(|spec| *spec.operator() != Operator::Equal))
-            {
-                return false;
-            }
-            if !specifiers(requirement)
-                .iter()
-                .filter(|spec| {
-                    matches!(
-                        spec.operator(),
-                        Operator::LessThan
-                            | Operator::LessThanEqual
-                            | Operator::NotEqual
-                            | Operator::NotEqualStar
-                    )
-                })
-                .all(|spec| specifier_contains(spec, version))
-            {
-                return false;
-            }
-            if target != "latest" {
-                let Some(before) = before else {
-                    return false;
-                };
-                if before.epoch() != version.epoch() {
-                    return false;
-                }
-                let width = if target == "patch" { 2 } else { 1 };
-                if (0..width).any(|index| {
-                    before.release().get(index).copied().unwrap_or(0)
-                        != version.release().get(index).copied().unwrap_or(0)
-                }) {
-                    return false;
-                }
-            }
-            if let (Some(python), Some(metadata)) = (python, &release.requires_python)
-                && !metadata.is_empty()
-            {
-                // Invalid metadata cannot prove compatibility with the Python floor.
-                return metadata
-                    .parse::<VersionSpecifiers>()
-                    .is_ok_and(|specs| specifiers_contain(&specs, python));
-            }
-            true
-        })
-        .map(|release| &release.version)
-        .max()
-        .cloned()
+    evaluate(
+        requirement,
+        releases,
+        &CandidatePolicy {
+            target: target.into(),
+            ..CandidatePolicy::default()
+        },
+        python,
+    )
+    .selected
 }
 
 #[cfg(test)]
@@ -210,6 +375,8 @@ mod tests {
             .map(|value| Release {
                 version: version(value),
                 requires_python: None,
+                uploaded: None,
+                yanked: false,
             })
             .collect()
     }
@@ -293,14 +460,20 @@ mod tests {
             Release {
                 version: version("1.8"),
                 requires_python: Some(">=3.10".into()),
+                uploaded: None,
+                yanked: false,
             },
             Release {
                 version: version("2"),
                 requires_python: Some(">=3.12".into()),
+                uploaded: None,
+                yanked: false,
             },
             Release {
                 version: version("3"),
                 requires_python: Some("nonsense".into()),
+                uploaded: None,
+                yanked: false,
             },
         ];
         let req = "demo>=1".parse().unwrap();
@@ -315,6 +488,8 @@ mod tests {
         values.push(Release {
             version: version("2"),
             requires_python: Some(">=3.10".into()),
+            uploaded: None,
+            yanked: false,
         });
         assert_eq!(
             choose_version(&req, &values, "latest", Some(&version("3.10"))),
@@ -364,6 +539,8 @@ mod tests {
         let releases = vec![Release {
             version: version("2.0"),
             requires_python: Some(">=3.10,!=3.10.1.*".into()),
+            uploaded: None,
+            yanked: false,
         }];
         assert_eq!(
             choose_version(&req, &releases, "latest", Some(&version("3.10"))),
@@ -410,6 +587,397 @@ mod tests {
             let updated = replacement(&req, original, &found).unwrap();
             assert_eq!(updated, "demo==1.2.5+internal");
             assert!(updated.parse::<Requirement>().is_ok());
+        }
+    }
+
+    fn decision(requirement: &str, values: &[&str], policy: CandidatePolicy) -> Decision {
+        evaluate(
+            &requirement.parse().unwrap(),
+            &releases(values),
+            &policy,
+            None,
+        )
+    }
+
+    fn artifact(value: &str, python: Option<&str>, uploaded: Option<i64>, yanked: bool) -> Release {
+        Release {
+            version: version(value),
+            requires_python: python.map(str::to_owned),
+            uploaded,
+            yanked,
+        }
+    }
+
+    #[test]
+    fn observations_are_independent_of_policy_and_include_current_versions() {
+        let values = vec![
+            artifact("1", None, None, false),
+            artifact("2", Some(">=3.12"), Some(101), false),
+            artifact("3", None, None, true),
+            artifact("4rc1", None, None, false),
+            artifact("5a1", None, None, true),
+            artifact("6.dev1", None, None, false),
+        ];
+        let result = evaluate(
+            &"demo>=2,<3".parse().unwrap(),
+            &values,
+            &CandidatePolicy::default(),
+            Some(&version("3.10")),
+        );
+        assert_eq!(result.latest, Some(version("2")));
+        assert_eq!(result.prerelease, Some(version("4rc1")));
+        assert_eq!(result.selected, None);
+        assert_eq!(result.reason, Some("blocked"));
+        assert_eq!(result.rejected.len(), 4);
+        assert!(
+            result
+                .rejected
+                .iter()
+                .all(|(value, _)| value > &version("2"))
+        );
+        assert_eq!(result.rejected[0].0, version("6.dev1"));
+    }
+
+    #[test]
+    fn decisions_distinguish_empty_current_and_unsupported_requirements() {
+        for (req, values) in [("demo>=1", vec![]), ("demo>=2", vec!["1", "2", "2.0"])] {
+            let result = decision(req, &values, CandidatePolicy::default());
+            assert_eq!(result.selected, None);
+            assert_eq!(result.reason, Some("no_newer_release"));
+            assert!(result.rejected.is_empty());
+        }
+        for req in [
+            "demo @ https://example.org/demo.whl",
+            "demo>1",
+            "demo==1.*",
+            "demo>=1,>=2",
+        ] {
+            let result = decision(req, &["3"], CandidatePolicy::default());
+            assert_eq!(result.selected, None, "{req}");
+            assert_eq!(result.reason, Some("unsupported_requirement"));
+            assert_eq!(result.latest, Some(version("3")));
+        }
+    }
+
+    #[test]
+    fn every_applicable_candidate_reason_is_retained() {
+        let values = [artifact("3rc1+local", Some(">=3.12"), Some(101), true)];
+        let result = evaluate(
+            &"demo>=1.2,<2,!=3rc1".parse().unwrap(),
+            &values,
+            &CandidatePolicy {
+                target: "patch".into(),
+                cutoff: Some(100),
+                exact: Some(version("4")),
+                ..CandidatePolicy::default()
+            },
+            Some(&version("3.10")),
+        );
+        assert_eq!(
+            result.rejected,
+            vec![(
+                version("3rc1+local"),
+                vec![
+                    "upper_bound",
+                    "excluded",
+                    "target",
+                    "python",
+                    "prerelease",
+                    "yanked",
+                    "cooldown",
+                    "local_version",
+                    "exact_target",
+                ],
+            )]
+        );
+        assert_eq!(result.latest, None);
+        assert_eq!(result.prerelease, None);
+        assert_eq!(result.reason, Some("blocked"));
+    }
+
+    #[test]
+    fn python_and_cooldown_must_pass_on_the_same_artifact() {
+        let req = "demo>=1".parse().unwrap();
+        let policy = CandidatePolicy {
+            cutoff: Some(100),
+            ..CandidatePolicy::default()
+        };
+        let mut values = vec![
+            artifact("1.5", None, Some(99), false),
+            artifact("2", Some(">=3.12"), Some(99), false),
+            artifact("2", Some(">=3.10"), Some(101), false),
+        ];
+        for _ in 0..2 {
+            let result = evaluate(&req, &values, &policy, Some(&version("3.10")));
+            assert_eq!(result.selected, Some(version("1.5")));
+            assert_eq!(result.reason, None);
+            assert_eq!(
+                result.rejected,
+                vec![(version("2"), vec!["python", "cooldown"])]
+            );
+            values.reverse();
+        }
+        // One qualifying artifact admits the version, regardless of other files.
+        values.push(artifact("2", Some(">=3.10"), Some(100), false));
+        let result = evaluate(&req, &values, &policy, Some(&version("3.10")));
+        assert_eq!(result.selected, Some(version("2")));
+        assert!(result.rejected.is_empty());
+    }
+
+    #[test]
+    fn cooldown_is_inclusive_and_unknown_times_fail_only_when_active() {
+        let req = "demo>=1".parse().unwrap();
+        let values = vec![
+            artifact("2", None, Some(100), false),
+            artifact("3", None, Some(101), false),
+            artifact("4", None, None, false),
+        ];
+        let result = evaluate(
+            &req,
+            &values,
+            &CandidatePolicy {
+                cutoff: Some(100),
+                ..CandidatePolicy::default()
+            },
+            None,
+        );
+        assert_eq!(result.selected, Some(version("2")));
+        assert_eq!(result.latest, Some(version("4")));
+        assert_eq!(
+            result.rejected,
+            vec![
+                (version("4"), vec!["unknown_upload_time"]),
+                (version("3"), vec!["cooldown"]),
+            ]
+        );
+        assert_eq!(
+            evaluate(&req, &values, &CandidatePolicy::default(), None).selected,
+            Some(version("4"))
+        );
+        let all_recent = evaluate(
+            &req,
+            &values[1..],
+            &CandidatePolicy {
+                cutoff: Some(100),
+                ..CandidatePolicy::default()
+            },
+            None,
+        );
+        assert_eq!(all_recent.selected, None);
+        assert_eq!(all_recent.reason, Some("blocked"));
+    }
+
+    #[test]
+    fn yanked_old_artifact_cannot_supply_cooldown_eligibility() {
+        let values = vec![
+            artifact("2", None, Some(99), true),
+            artifact("2", None, Some(101), false),
+            artifact("3", None, None, true),
+        ];
+        let result = evaluate(
+            &"demo>=1".parse().unwrap(),
+            &values,
+            &CandidatePolicy {
+                cutoff: Some(100),
+                ..CandidatePolicy::default()
+            },
+            None,
+        );
+        assert_eq!(result.selected, None);
+        assert_eq!(result.latest, Some(version("2")));
+        assert_eq!(
+            result.rejected,
+            vec![
+                (version("3"), vec!["yanked", "unknown_upload_time"]),
+                (version("2"), vec!["yanked", "cooldown"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn prerelease_policy_uses_pep440_order_and_never_allows_development() {
+        let values = ["2a1", "2b1", "2rc1", "2.dev9", "2rc2.dev1", "1.9"];
+        let result = decision("demo>=1", &values, CandidatePolicy::default());
+        assert_eq!(result.selected, Some(version("1.9")));
+        assert_eq!(result.prerelease, Some(version("2rc1")));
+        assert!(
+            result
+                .rejected
+                .iter()
+                .any(|(value, reasons)| value == &version("2.dev9") && reasons == &["development"])
+        );
+        let policy = CandidatePolicy {
+            allow_prerelease: true,
+            ..CandidatePolicy::default()
+        };
+        let result = decision("demo>=1", &values, policy.clone());
+        assert_eq!(result.selected, Some(version("2rc1")));
+        assert_eq!(result.rejected.len(), 2);
+        assert!(
+            result
+                .rejected
+                .iter()
+                .all(|(_, reasons)| reasons == &["development"])
+        );
+        for (values, expected) in [
+            (vec!["2rc1", "2"], "2"),
+            (vec!["2", "3rc1"], "3rc1"),
+            (vec!["2a1", "2b1"], "2b1"),
+            (vec!["2b1", "2rc1"], "2rc1"),
+        ] {
+            assert_eq!(
+                decision("demo>=1", &values, policy.clone()).selected,
+                Some(version(expected))
+            );
+        }
+        assert_eq!(
+            choose("demo>=1rc1", &["1rc2", "1", "2.dev1"], "latest"),
+            Some(version("1"))
+        );
+        assert_eq!(choose("demo>=1rc1", &["1rc2"], "latest"), None);
+    }
+
+    #[test]
+    fn prereleases_remain_subject_to_python_age_bounds_and_epochs() {
+        let values = vec![
+            artifact("1!2a1", Some(">=3.10"), Some(99), false),
+            artifact("1!2b1", Some(">=3.12"), Some(99), false),
+            artifact("1!2rc1", Some(">=3.10"), Some(101), false),
+            artifact("2!1rc1", None, Some(99), false),
+        ];
+        let result = evaluate(
+            &"demo>=1!1,<1!3".parse().unwrap(),
+            &values,
+            &CandidatePolicy {
+                cutoff: Some(100),
+                allow_prerelease: true,
+                target: "minor".into(),
+                ..CandidatePolicy::default()
+            },
+            Some(&version("3.10")),
+        );
+        // A minor target retains the first release component and the epoch.
+        assert_eq!(result.selected, None);
+        assert_eq!(result.rejected[0].1, vec!["upper_bound", "target"]);
+        let result = evaluate(
+            &"demo>=1!1,<1!3".parse().unwrap(),
+            &values,
+            &CandidatePolicy {
+                cutoff: Some(100),
+                allow_prerelease: true,
+                ..CandidatePolicy::default()
+            },
+            Some(&version("3.10")),
+        );
+        assert_eq!(result.selected, Some(version("1!2a1")));
+        assert_eq!(result.latest, None);
+    }
+
+    #[test]
+    fn minimal_suppresses_only_when_the_full_original_range_admits_the_candidate() {
+        let policy = CandidatePolicy {
+            minimal: true,
+            ..CandidatePolicy::default()
+        };
+        for (req, values, expected, reason) in [
+            ("demo>=1", vec!["2"], None, Some("minimal")),
+            ("demo", vec!["2"], None, Some("minimal")),
+            ("demo==1", vec!["2"], Some("2"), None),
+            ("demo~=1.2", vec!["1.9"], None, Some("minimal")),
+            ("demo~=1.2", vec!["2"], Some("2"), None),
+            ("demo~=1.2.3", vec!["1.3"], Some("1.3"), None),
+            ("demo>=1,<2", vec!["1.9", "2"], None, Some("minimal")),
+            (
+                "demo>=1,!=2.0.1.*",
+                vec!["2.0", "2.0.1"],
+                None,
+                Some("minimal"),
+            ),
+            ("demo>=1,!=2.0.0.*", vec!["2.0"], None, Some("blocked")),
+        ] {
+            let result = decision(req, &values, policy.clone());
+            assert_eq!(result.selected, expected.map(version), "{req}");
+            assert_eq!(result.reason, reason, "{req}");
+        }
+        let req = "demo>=1,!=2.0.0.*".parse().unwrap();
+        assert!(!requirement_contains(&req, &version("2")));
+        assert!(requirement_contains(&req, &version("2.1")));
+        assert!(!requirement_contains(
+            &"demo @ https://example.org/demo.whl".parse().unwrap(),
+            &version("2")
+        ));
+    }
+
+    #[test]
+    fn exact_targets_are_not_implicitly_downgraded_or_substituted() {
+        for (req, exact, values, expected) in [
+            ("demo>=1", "2", vec!["2", "3"], Some("2")),
+            ("demo>=1", "2", vec!["3"], None),
+            ("demo>=2", "1", vec!["1", "3"], None),
+            ("demo>=2", "2", vec!["2", "3"], None),
+            ("demo>=1,<2", "2", vec!["1.9", "2"], None),
+            ("demo>=1,!=2", "2", vec!["2", "3"], None),
+            ("demo>=1.2", "1.3", vec!["1.2.1", "1.3"], Some("1.3")),
+            ("demo>=1", "2rc1", vec!["2rc1"], None),
+            ("demo>=1", "2+local", vec!["2+local"], None),
+            ("demo==1+local", "2+local", vec!["2+local"], Some("2+local")),
+        ] {
+            let result = decision(
+                req,
+                &values,
+                CandidatePolicy {
+                    exact: Some(version(exact)),
+                    ..CandidatePolicy::default()
+                },
+            );
+            assert_eq!(result.selected, expected.map(version), "{req} -> {exact}");
+        }
+        let result = decision(
+            "demo>=1.2",
+            &["1.3"],
+            CandidatePolicy {
+                exact: Some(version("1.3")),
+                target: "patch".into(),
+                ..CandidatePolicy::default()
+            },
+        );
+        assert_eq!(result.rejected, vec![(version("1.3"), vec!["target"])]);
+        let result = decision(
+            "demo>=1",
+            &["2"],
+            CandidatePolicy {
+                exact: Some(version("2")),
+                minimal: true,
+                ..CandidatePolicy::default()
+            },
+        );
+        assert_eq!(result.selected, None);
+        assert_eq!(result.reason, Some("minimal"));
+    }
+
+    #[test]
+    fn exact_target_artifacts_must_pass_active_safety_rules() {
+        let req = "demo>=1".parse().unwrap();
+        let policy = CandidatePolicy {
+            exact: Some(version("2")),
+            cutoff: Some(100),
+            ..CandidatePolicy::default()
+        };
+        for (artifact, expected) in [
+            (artifact("2", None, Some(99), true), vec!["yanked"]),
+            (
+                artifact("2", Some(">=3.12"), Some(99), false),
+                vec!["python"],
+            ),
+            (artifact("2", None, Some(101), false), vec!["cooldown"]),
+            (
+                artifact("2", None, None, false),
+                vec!["unknown_upload_time"],
+            ),
+        ] {
+            let result = evaluate(&req, &[artifact], &policy, Some(&version("3.10")));
+            assert_eq!(result.selected, None);
+            assert_eq!(result.rejected, vec![(version("2"), expected)]);
         }
     }
 

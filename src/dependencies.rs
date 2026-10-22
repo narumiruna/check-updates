@@ -203,6 +203,75 @@ pub fn replacement(requirement: &Requirement, original: &str, latest: &Version) 
     None
 }
 
+/// Replace one explicit upper bound in a supported floor-and-bounds requirement.
+/// Keep all other tokens, including exclusions and markers, unchanged.
+pub fn replacement_bound(requirement: &Requirement, original: &str, bound: &str) -> Result<String> {
+    let bound = bound
+        .parse::<VersionSpecifier>()
+        .context("Invalid replacement upper bound")?;
+    ensure!(
+        matches!(
+            bound.operator(),
+            Operator::LessThan | Operator::LessThanEqual
+        ) && !bound.version().any_prerelease()
+            && !bound.version().is_local(),
+        "Replacement bound must be <VERSION or <=VERSION with a final non-local version"
+    );
+    ensure!(
+        unsupported_reason(requirement).is_none()
+            && !specifiers(requirement)
+                .iter()
+                .any(|spec| *spec.operator() == Operator::TildeEqual),
+        "Bound replacement needs a supported requirement with an explicit upper bound"
+    );
+    let uppers: Vec<_> = specifiers(requirement)
+        .iter()
+        .filter(|spec| {
+            matches!(
+                spec.operator(),
+                Operator::LessThan | Operator::LessThanEqual
+            )
+        })
+        .collect();
+    ensure!(
+        uppers.len() == 1,
+        "Bound replacement needs exactly one explicit upper bound"
+    );
+    let source = original
+        .parse::<Requirement>()
+        .context("Invalid original requirement for bound replacement")?;
+    ensure!(
+        source == *requirement,
+        "Original requirement does not match the parsed requirement"
+    );
+    static UPPER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(<=?)\s*([^\s,;)]+)").unwrap());
+    let before_marker = original.split(';').next().unwrap_or(original);
+    let tokens: Vec<_> = UPPER.captures_iter(before_marker).collect();
+    ensure!(
+        tokens.len() == 1,
+        "Bound replacement needs exactly one explicit upper-bound token"
+    );
+    let operator = tokens[0].get(1).unwrap();
+    let version = tokens[0].get(2).unwrap();
+    ensure!(
+        operator.as_str() == uppers[0].operator().to_string()
+            && version.as_str().parse::<Version>().ok().as_ref() == Some(uppers[0].version()),
+        "Cannot locate the original upper-bound token"
+    );
+    let mut result = original.to_owned();
+    if bound.version() != uppers[0].version() {
+        result.replace_range(version.range(), &bound.version().to_string());
+    }
+    if bound.operator() != uppers[0].operator() {
+        result.replace_range(operator.range(), &bound.operator().to_string());
+    }
+    // Validate the resulting shape without rewriting the requirement text.
+    result
+        .parse::<Requirement>()
+        .context("Invalid requirement after upper-bound replacement")?;
+    Ok(result)
+}
+
 /// Describe the declared baseline, not an installed version or compatibility.
 pub fn version_change(update: &Update) -> &'static str {
     let Ok(requirement) = update.dependency.requirement.parse::<Requirement>() else {
@@ -479,6 +548,130 @@ dev = [{include-group = "other"}, "Demo~=1.0"]
         assert_eq!(
             replacement(&requirement("demo>=v1.0"), "demo>=v1.0", &version("2")),
             Some("demo>=2".into())
+        );
+    }
+
+    #[test]
+    fn bound_replacement_changes_only_the_requested_operator_and_version() {
+        for (original, bound, expected) in [
+            ("demo>=1,<2", "<3", "demo>=1,<3"),
+            ("demo>=1,<=2", "<3", "demo>=1,<3"),
+            ("demo>=1,<2", "<=3", "demo>=1,<=3"),
+            ("demo>=1,<=3", "<2", "demo>=1,<2"),
+            (
+                "Demo[all] ( >= 1 , < 2 , != 1.5.* ) ; python_version < '3.14'",
+                "<=3",
+                "Demo[all] ( >= 1 , <= 3 , != 1.5.* ) ; python_version < '3.14'",
+            ),
+            (
+                "demo<2,>=1,!=1.5,!=2.5.*",
+                "<=3",
+                "demo<=3,>=1,!=1.5,!=2.5.*",
+            ),
+            (
+                "demo>=1, <\t2  ; python_version <= '3.14'",
+                "<=3",
+                "demo>=1, <=\t3  ; python_version <= '3.14'",
+            ),
+            ("demo>=1,<=v2.0", "<2", "demo>=1,<v2.0"),
+            ("demo>=1,<2", "<1!3.0", "demo>=1,<1!3.0"),
+        ] {
+            let result = replacement_bound(&requirement(original), original, bound).unwrap();
+            assert_eq!(result, expected, "{original} -> {bound}");
+            assert!(result.parse::<Requirement>().is_ok());
+        }
+    }
+
+    #[test]
+    fn bound_replacement_preserves_no_ops_and_semantically_equal_tokens() {
+        for (original, bound) in [
+            ("demo>=1,<2", "<2"),
+            ("demo>=1, <= v2.0 ; python_version < '3.14'", "<=2"),
+            ("demo>=1, < 2.0.0 , !=1.5", "<2.0"),
+        ] {
+            assert_eq!(
+                replacement_bound(&requirement(original), original, bound).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn bound_replacement_rejects_implicit_ambiguous_and_unsupported_shapes() {
+        for original in [
+            "demo",
+            "demo>=1",
+            "demo==1",
+            "demo~=1.0",
+            "demo~=1.0,<2",
+            "demo>=1,<2,<3",
+            "demo>=1,<2,<=3",
+            "demo>=1,<2,<2",
+            "demo>1,<2",
+            "demo==1,<2",
+            "demo>=1,>=1.5,<2",
+            "demo<2",
+            "demo<2,!=1.5",
+            "demo @ https://example.org/demo.whl",
+        ] {
+            assert!(
+                replacement_bound(&requirement(original), original, "<3").is_err(),
+                "{original}"
+            );
+        }
+        // The parsed requirement must identify the same occurrence text.
+        assert!(replacement_bound(&requirement("demo>=1,<2"), "other>=1,<2", "<3").is_err());
+        assert!(replacement_bound(&requirement("demo>=1,<2"), "demo>=1,<2,<2", "<3").is_err());
+    }
+
+    #[test]
+    fn bound_replacement_validates_the_new_bound_without_inventing_one() {
+        let original = "demo>=1,<2,!=1.5";
+        for bound in [
+            "",
+            "3",
+            ">=3",
+            "~=3.0",
+            "==3",
+            "foo<3",
+            "<3,!=2",
+            "<3,<=4",
+            "<3.*",
+            "<3+local",
+            "<3rc1",
+            "<3.dev1",
+            "<3; python_version < '4'",
+        ] {
+            assert!(
+                replacement_bound(&requirement(original), original, bound).is_err(),
+                "{bound}"
+            );
+        }
+        assert_eq!(
+            replacement_bound(&requirement(original), original, " < 3 ").unwrap(),
+            "demo>=1,<3,!=1.5"
+        );
+    }
+
+    #[test]
+    fn bound_replacement_keeps_toml_comments_and_occurrence_identity() {
+        let original = "[project]\r\ndependencies = [\r\n  'demo[all]>=1, < 2, !=1.5; python_version < \"3.14\"', # Keep bound.\r\n  'demo>=1,<2',\r\n]\r\n";
+        let mut document = original.parse::<DocumentMut>().unwrap();
+        let dependency = dependencies(&document).remove(0);
+        let parsed = requirement(&dependency.requirement);
+        let replacement = replacement_bound(&parsed, &dependency.requirement, "<=3").unwrap();
+        let change = Update {
+            dependency,
+            replacement,
+            version: version("2.5"),
+            release_link: None,
+            project_link: None,
+        };
+        apply_update(&mut document, &change).unwrap();
+        // toml_edit normalizes CRLF on serialization; all other text is retained.
+        assert_eq!(
+            document.to_string(),
+            original.replace(", < 2,", ", <= 3,").replace("\r\n", "\n")
         );
     }
 
