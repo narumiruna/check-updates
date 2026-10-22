@@ -26,7 +26,7 @@ cache-keys = [
 ]
 
 [tool.bumpversion]
-current_version = "0.0.4"
+current_version = "0.0.5"
 tag = true
 commit = true
 pre_commit_hooks = ["cargo update --workspace", "uv lock", "git add Cargo.lock uv.lock"]
