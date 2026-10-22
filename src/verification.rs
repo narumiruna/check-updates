@@ -846,8 +846,12 @@ pub fn prepare_with_deadline(
     let mut snapshots = Vec::new();
     for (position, project) in projects.iter().enumerate() {
         budget(deadline)?;
+        let original_document: DocumentMut = std::str::from_utf8(&project.original)?
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Cannot parse project source snapshot"))?;
+        // Parsing normalizes CRLF, so compare both parsed representations.
         ensure!(
-            project.document.to_string().as_bytes() == project.original,
+            project.document.to_string() == original_document.to_string(),
             "Project document differs from its original source snapshot"
         );
         check_project(project)?;

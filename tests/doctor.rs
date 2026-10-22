@@ -197,6 +197,42 @@ fn passing_batch_is_retested_and_applies_exact_manifest_and_lock() {
 }
 
 #[test]
+fn successful_doctor_preserves_original_crlf_manifest_bytes() {
+    let mut fixture = Fixture::new("assert version('doctor-demo') in ('1.0', '2.0')");
+    let manifest = String::from_utf8(fixture.manifest.clone())
+        .unwrap()
+        .replace('\n', "\r\n");
+    let expected = manifest.replace("doctor-demo==1.0", "doctor-demo==2.0");
+    change_scope(&mut fixture, manifest);
+    fixture.run().unwrap();
+    assert_eq!(
+        fs::read(fixture.root.join("pyproject.toml")).unwrap(),
+        expected.into_bytes()
+    );
+    assert!(!fixture.root.join(".venv").exists());
+}
+
+#[test]
+fn large_diagnostic_streams_do_not_change_inspection_or_literal_arguments() {
+    let fixture = Fixture::new("pass");
+    fixture
+        .run_command(&[
+            "python".into(),
+            "-I".into(),
+            "-c".into(),
+            "import sys; assert sys.argv[1] == 'literal;not-a-command'; assert not sys.stdin.read(); sys.stdout.write('x' * 100000); sys.stderr.write('y' * 100000)".into(),
+            "literal;not-a-command".into(),
+        ])
+        .unwrap();
+    assert!(
+        fs::read_to_string(fixture.root.join("pyproject.toml"))
+            .unwrap()
+            .contains("doctor-demo==2.0")
+    );
+    assert!(!fixture.root.join(".venv").exists());
+}
+
+#[test]
 fn no_passing_candidate_leaves_original_inputs_unchanged() {
     let fixture = Fixture::new("sys.exit(0 if version('doctor-demo') == '1.0' else 1)");
     let error = fixture.run().unwrap_err();

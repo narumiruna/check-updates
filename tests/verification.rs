@@ -39,6 +39,26 @@ fn uv(directory: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn cli_command(directory: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_check-updates"));
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("UV_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(directory)
+        .args(args)
+        .stdin(Stdio::null())
+        .env("UV_PYTHON_DOWNLOADS", "never")
+        .env("NO_COLOR", "1");
+    command
+}
+
 struct Fixture {
     directory: TempDir,
     project: Project,
@@ -250,8 +270,7 @@ fn package_cutoff_overrides_global_and_unknown_registry_timestamps_fail_closed()
     }
 }
 
-#[test]
-fn cooldown_refreshes_recent_locked_transitives_and_enforces_package_overrides() {
+fn transitive_fixture() -> (Fixture, WheelIndex) {
     assert!(uv_available());
     let fixture = Fixture::new();
     let wheels = fixture.root().join("wheels");
@@ -289,6 +308,12 @@ fn cooldown_refreshes_recent_locked_transitives_and_enforces_package_overrides()
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    (fixture, index)
+}
+
+#[test]
+fn cooldown_refreshes_recent_locked_transitives_and_enforces_package_overrides() {
+    let (fixture, _index) = transitive_fixture();
     let before = fixture.lock();
     let project = read_project(&fixture.project.path).unwrap();
     let mut pending = fixture.pending("2.0");
@@ -329,6 +354,113 @@ fn cooldown_refreshes_recent_locked_transitives_and_enforces_package_overrides()
             .unwrap()
             .contains("demo>=1.0,<3")
     );
+}
+
+#[test]
+fn cli_verifies_configured_cooldowns_for_transitive_and_excluded_packages() {
+    for direct in [false, true] {
+        let (fixture, _index) = transitive_fixture();
+        let mut original = fs::read_to_string(&fixture.project.path).unwrap();
+        if direct {
+            original = original.replace(
+                "dependencies=['demo>=1']",
+                "dependencies=['demo>=1','child>=1']",
+            );
+        }
+        original.push_str("\n[tool.check-updates.packages.child]\ncooldown='7d'\n");
+        fs::write(&fixture.project.path, &original).unwrap();
+        let initial = uv(
+            fixture.root(),
+            &[
+                "lock",
+                "--no-build",
+                "--no-python-downloads",
+                "--upgrade-package",
+                "demo==1.0",
+                "--upgrade-package",
+                "child==2.0",
+            ],
+        );
+        assert!(
+            initial.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initial.stderr)
+        );
+        let before = fixture.lock();
+        let output = cli_command(
+            fixture.root(),
+            &["-u", "--to", "demo==2.0", "--exclude", "child"],
+        )
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lock: toml_edit::DocumentMut =
+            String::from_utf8(fixture.lock()).unwrap().parse().unwrap();
+        let child = lock["package"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .find(|package| package["name"].as_str() == Some("child"))
+            .unwrap();
+        assert_eq!(
+            child["version"].as_str(),
+            Some("1.0"),
+            "configured package cutoff was bypassed; direct={direct}"
+        );
+
+        // Neither a read-only report nor --no-lock may start uv.
+        fs::write(&fixture.project.path, &original).unwrap();
+        fs::write(fixture.root().join("uv.lock"), &before).unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        let output = cli_command(
+            fixture.root(),
+            &[
+                "--format",
+                "json",
+                "--to",
+                "demo==2.0",
+                "--exclude",
+                "child",
+            ],
+        )
+        .env("PATH", empty_path.path())
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&fixture.project.path).unwrap(), original);
+        assert_eq!(fixture.lock(), before);
+        let output = cli_command(
+            fixture.root(),
+            &["-u", "--no-lock", "--to", "demo==2.0", "--exclude", "child"],
+        )
+        .env("PATH", empty_path.path())
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fixture.lock(), before);
+        assert!(
+            fs::read_to_string(&fixture.project.path)
+                .unwrap()
+                .contains("demo>=2.0")
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("transitive dependencies were not verified")
+        );
+        assert!(!fixture.root().join(".venv").exists());
+    }
 }
 
 #[test]

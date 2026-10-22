@@ -27,7 +27,10 @@ use crate::{changes, check_interrupt};
 const MAX_ATTEMPTS: usize = 32; // Includes baseline and final confirmation.
 const MAX_RUNTIME: Duration = Duration::from_secs(10 * 60);
 #[cfg(unix)]
-const OUTPUT_LIMIT: usize = 8192; // Per stream.
+const OUTPUT_LIMIT: usize = 8192; // Per diagnostic stream.
+const INSPECTION_BATCH_LIMIT: usize = 16 * 1024;
+const INSPECTION_NAME_LIMIT: usize = 4096; // Serialized JSON bytes.
+const INSPECTION_VERSION_LIMIT: usize = 1024; // Serialized JSON bytes.
 
 /// Run only after explicit `--doctor -u` and a user-supplied test command.
 /// Nothing is applied unless baseline and final combined tests pass.
@@ -334,30 +337,11 @@ fn test_verified(
             ))
         })
         .collect::<Result<_>>()?;
-    let script = "import importlib.metadata as m, json, sys\nr={}\nfor n in json.loads(sys.argv[1]):\n try: r[n]=m.version(n)\n except m.PackageNotFoundError: r[n]=None\nprint(json.dumps(r))";
-    let mut inspect = isolated_command("python", directory)?;
-    inspect
-        .args(["-I", "-c", script])
-        .arg(serde_json::to_string(
-            &names.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-        )?);
-    let installed = run_command(&mut inspect, deadline, || check_budget(deadline))?;
-    ensure!(
-        installed.status.success(),
-        "Cannot inspect isolated Doctor distributions; no updates were applied"
-    );
-    let installed: serde_json::Value = serde_json::from_slice(&installed._stdout)
-        .context("Cannot inspect isolated Doctor distributions")?;
-    for (name, version) in names {
-        let actual = installed[&name]
-            .as_str()
-            .and_then(|v| v.parse::<pep440_rs::Version>().ok());
-        if actual.is_none() || exact && actual.as_ref() != Some(&version) {
-            eprintln!(
-                "Doctor: a selected distribution is absent or has a different version on this interpreter; this scope cannot be described as tested."
-            );
-            return Ok(false);
-        }
+    if !inspect_distributions(directory, &names, exact, deadline)? {
+        eprintln!(
+            "Doctor: a selected distribution is absent or has a different version on this interpreter; this scope cannot be described as tested."
+        );
+        return Ok(false);
     }
     let mut test = isolated_command(&test_command[0], directory)?;
     test.args(&test_command[1..]);
@@ -374,6 +358,116 @@ fn test_verified(
         );
     }
     Ok(result.status.success())
+}
+
+// Structured data has its own strict bound. Diagnostic retention must not cut JSON.
+fn inspect_distributions(
+    directory: &Path,
+    names: &[(String, pep440_rs::Version)],
+    exact: bool,
+    deadline: Instant,
+) -> Result<bool> {
+    let script = r#"
+import importlib.metadata as m, json, sys
+records = []
+size = 2
+for name in json.loads(sys.argv[1]):
+    try:
+        version = m.version(name)
+    except m.PackageNotFoundError:
+        version = None
+    encoded = json.dumps(version, ensure_ascii=False, separators=(',', ':'))
+    if len(encoded.encode('utf-8')) > int(sys.argv[2]):
+        sys.exit(80)
+    record = '[' + json.dumps(name, ensure_ascii=False) + ',' + encoded + ']'
+    size += len(record.encode('utf-8')) + bool(records)
+    if size > int(sys.argv[3]):
+        sys.exit(81)
+    records.append(record)
+sys.stdout.write('[' + ','.join(records) + ']')
+"#;
+    let mut start = 0;
+    while start < names.len() {
+        check_budget(deadline)?;
+        let mut request = String::from("[");
+        let mut response_bytes = 2; // Outer array brackets.
+        let mut end = start;
+        for (name, _) in &names[start..] {
+            check_budget(deadline)?;
+            // Check before serialization as well, so one large name is not copied.
+            ensure!(
+                name.len() <= INSPECTION_NAME_LIMIT,
+                "Doctor distribution name exceeds the structured inspection size limit"
+            );
+            let encoded = serde_json::to_string(name)?;
+            ensure!(
+                encoded.len() <= INSPECTION_NAME_LIMIT,
+                "Doctor distribution name exceeds the structured inspection size limit"
+            );
+            let comma = usize::from(end > start);
+            // Each response record is [name, version]. Reserve the maximum
+            // serialized version, but count the actual serialized name bytes.
+            let record_bytes = encoded.len() + INSPECTION_VERSION_LIMIT + 3;
+            if request.len() + comma + encoded.len() + 1 > INSPECTION_BATCH_LIMIT
+                || response_bytes + comma + record_bytes > INSPECTION_BATCH_LIMIT
+            {
+                break;
+            }
+            if comma != 0 {
+                request.push(',');
+            }
+            request.push_str(&encoded);
+            response_bytes += comma + record_bytes;
+            end += 1;
+        }
+        ensure!(
+            end > start,
+            "Doctor inspection record exceeds the batch size limit"
+        );
+        request.push(']');
+        let mut command = isolated_command("python", directory)?;
+        command
+            .args(["-I", "-c", script])
+            .arg(request)
+            .arg(INSPECTION_VERSION_LIMIT.to_string())
+            .arg(INSPECTION_BATCH_LIMIT.to_string());
+        let result = run_command_with_stdout_limit(
+            &mut command,
+            deadline,
+            || check_budget(deadline),
+            Some(INSPECTION_BATCH_LIMIT),
+        )?;
+        match result.status.code() {
+            Some(80) => {
+                bail!("Doctor distribution version exceeds the structured inspection size limit")
+            }
+            Some(81) => bail!("Doctor structured inspection response exceeds the size limit"),
+            _ => ensure!(
+                result.status.success(),
+                "Cannot inspect isolated Doctor distributions; no updates were applied"
+            ),
+        }
+        // Do not include parse errors or child bytes in diagnostics.
+        let installed: Vec<(String, Option<String>)> = serde_json::from_slice(&result._stdout)
+            .map_err(|_| anyhow!("Invalid Doctor structured inspection response"))?;
+        ensure!(
+            installed.len() == end - start,
+            "Incomplete Doctor structured inspection response"
+        );
+        for ((name, expected), (returned, version)) in names[start..end].iter().zip(installed) {
+            ensure!(
+                name == &returned,
+                "Invalid Doctor structured inspection record"
+            );
+            let actual = version.and_then(|v| v.parse::<pep440_rs::Version>().ok());
+            if actual.is_none() || exact && actual.as_ref() != Some(expected) {
+                return Ok(false);
+            }
+        }
+        start = end;
+    }
+    check_budget(deadline)?;
+    Ok(true)
 }
 
 fn isolated_command(program: &str, directory: &Path) -> Result<Command> {
@@ -453,11 +547,20 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-#[cfg(unix)]
 fn run_command(
     command: &mut Command,
     deadline: Instant,
+    check: impl FnMut() -> Result<()>,
+) -> Result<CommandResult> {
+    run_command_with_stdout_limit(command, deadline, check, None)
+}
+
+#[cfg(unix)]
+fn run_command_with_stdout_limit(
+    command: &mut Command,
+    deadline: Instant,
     mut check: impl FnMut() -> Result<()>,
+    stdout_limit: Option<usize>,
 ) -> Result<CommandResult> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
@@ -470,7 +573,9 @@ fn run_command(
     fn reader(
         mut pipe: impl Read + AsRawFd + Send + 'static,
         done: Arc<AtomicBool>,
-    ) -> Result<thread::JoinHandle<Vec<u8>>> {
+        limit: usize,
+        strict: bool,
+    ) -> Result<thread::JoinHandle<Result<Vec<u8>>>> {
         let fd = pipe.as_raw_fd();
         // SAFETY: fd is a live pipe owned by this reader; only status flags change.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -485,7 +590,11 @@ fn run_command(
                 match pipe.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(size) => {
-                        let keep = size.min(OUTPUT_LIMIT - retained.len());
+                        let keep = size.min(limit - retained.len());
+                        ensure!(
+                            !strict || keep == size,
+                            "Doctor structured inspection response exceeds the size limit"
+                        );
                         retained.extend_from_slice(&buffer[..keep]);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -495,16 +604,17 @@ fn run_command(
                         thread::sleep(Duration::from_millis(5));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) if strict => bail!("Cannot read Doctor structured inspection response"),
                     Err(_) => break,
                 }
                 // Drain buffered output after exit. Stopping immediately on
                 // `done` can lose a short JSON response written during sleep.
                 // The retention limit also bounds a daemon that keeps writing.
-                if done.load(Ordering::Relaxed) && retained.len() == OUTPUT_LIMIT {
+                if done.load(Ordering::Relaxed) && !strict && retained.len() == limit {
                     break;
                 }
             }
-            retained
+            Ok(retained)
         }))
     }
 
@@ -529,6 +639,8 @@ fn run_command(
             .take()
             .context("Missing Doctor stdout")?,
         done.clone(),
+        stdout_limit.unwrap_or(OUTPUT_LIMIT),
+        stdout_limit.is_some(),
     )?;
     let stderr = match reader(
         child
@@ -537,6 +649,8 @@ fn run_command(
             .take()
             .context("Missing Doctor stderr")?,
         done.clone(),
+        OUTPUT_LIMIT,
+        false,
     ) {
         Ok(reader) => reader,
         Err(error) => {
@@ -563,20 +677,21 @@ fn run_command(
     // waiting for EOF: a daemon can retain a pipe after escaping the process group.
     child.stop();
     done.store(true, Ordering::Relaxed);
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    let stdout = stdout.join();
+    let stderr = stderr.join();
     Ok(CommandResult {
         status: result?,
-        _stdout: stdout,
-        _stderr: stderr,
+        _stdout: stdout.map_err(|_| anyhow!("Doctor stdout reader failed"))??,
+        _stderr: stderr.map_err(|_| anyhow!("Doctor stderr reader failed"))??,
     })
 }
 
 #[cfg(not(unix))]
-fn run_command(
+fn run_command_with_stdout_limit(
     _command: &mut Command,
     _deadline: Instant,
     _check: impl FnMut() -> Result<()>,
+    _stdout_limit: Option<usize>,
 ) -> Result<CommandResult> {
     bail!("Doctor requires supported process-tree cleanup")
 }
@@ -584,6 +699,204 @@ fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn distribution_fixture(records: &[(String, String)]) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        // Use only the standard library and an offline interpreter. No package
+        // install is needed: importlib.metadata reads these dist-info records.
+        let script = r#"
+import json, pathlib, subprocess, sys, venv
+root = pathlib.Path(sys.argv[1]) / '.venv'
+venv.EnvBuilder(with_pip=False).create(root)
+python = root / 'bin' / 'python'
+site = pathlib.Path(subprocess.check_output([str(python), '-I', '-c', "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
+for name, version in json.loads(sys.argv[2]):
+    info = site / (name.replace('-', '_') + '-1.0.dist-info')
+    info.mkdir()
+    (info / 'METADATA').write_text('Metadata-Version: 2.1\nName: ' + name + '\nVersion: ' + version + '\n', encoding='utf-8')
+"#;
+        let mut command = Command::new("uv");
+        command
+            .current_dir(temp.path())
+            .args([
+                "run",
+                "--no-project",
+                "--offline",
+                "--no-python-downloads",
+                "python",
+                "-I",
+                "-c",
+                script,
+            ])
+            .arg(temp.path())
+            .arg(serde_json::to_string(records).unwrap())
+            .stdin(Stdio::null());
+        let result = run_command(
+            &mut command,
+            Instant::now() + Duration::from_secs(30),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(result.status.success(), "offline Python fixture failed");
+        temp
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_distribution_scope_exceeds_old_diagnostic_capture_but_is_inspected() {
+        let records: Vec<_> = (0..400)
+            .map(|index| {
+                (
+                    format!("doctor-inspection-package-{index:04}"),
+                    "2.0".to_string(),
+                )
+            })
+            .collect();
+        let temp = distribution_fixture(&records);
+        let names: Vec<_> = records
+            .iter()
+            .map(|(name, version)| (name.clone(), version.parse().unwrap()))
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // Reproduce the old inspection command against real Python metadata.
+        let script = "import importlib.metadata as m, json, sys; print(json.dumps({n:m.version(n) for n in json.loads(sys.argv[1])}))";
+        let mut legacy = isolated_command("python", temp.path()).unwrap();
+        legacy.args(["-I", "-c", script]).arg(
+            serde_json::to_string(&records.iter().map(|(n, _)| n).collect::<Vec<_>>()).unwrap(),
+        );
+        let full = run_command_with_stdout_limit(&mut legacy, deadline, || Ok(()), Some(64 * 1024))
+            .unwrap();
+        assert!(full.status.success());
+        assert!(full._stdout.len() > OUTPUT_LIMIT);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&full._stdout)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            names.len()
+        );
+        let truncated = run_command(&mut legacy, deadline, || Ok(())).unwrap();
+        assert!(truncated.status.success());
+        assert_eq!(truncated._stdout.len(), OUTPUT_LIMIT);
+        assert!(serde_json::from_slice::<serde_json::Value>(&truncated._stdout).is_err());
+        assert!(inspect_distributions(temp.path(), &names, true, deadline).unwrap());
+        // Check the last batch too, not only the first response.
+        let mut mismatch = names.clone();
+        mismatch.last_mut().unwrap().1 = "3.0".parse().unwrap();
+        assert!(!inspect_distributions(temp.path(), &mismatch, true, deadline).unwrap());
+        assert!(inspect_distributions(temp.path(), &mismatch, false, deadline).unwrap());
+        mismatch.last_mut().unwrap().0 = "doctor-missing-distribution".into();
+        for exact in [false, true] {
+            assert!(!inspect_distributions(temp.path(), &mismatch, exact, deadline).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_counts_long_names_and_versions_in_bytes() {
+        // A full response batch exceeds the diagnostic limit. Names stay below
+        // the filesystem component limit, but are much longer than normal names.
+        let version = format!("2.0+{}", "a".repeat(900));
+        let records: Vec<_> = (0..40)
+            .map(|index| {
+                (
+                    format!("doctor-{index}-{}", "x".repeat(180)),
+                    version.clone(),
+                )
+            })
+            .collect();
+        let temp = distribution_fixture(&records);
+        let names: Vec<_> = records
+            .iter()
+            .map(|(name, version)| (name.clone(), version.parse().unwrap()))
+            .collect();
+        assert!(
+            inspect_distributions(
+                temp.path(),
+                &names,
+                true,
+                Instant::now() + Duration::from_secs(30)
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_inspection_names_and_versions_fail_clearly() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // No command may start for an oversized first name.
+        for name in [
+            "x".repeat(INSPECTION_NAME_LIMIT + 1),
+            "\n".repeat(INSPECTION_NAME_LIMIT / 2),
+        ] {
+            let error = inspect_distributions(
+                Path::new("missing-doctor-root"),
+                &[(name, "2.0".parse().unwrap())],
+                true,
+                deadline,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("name exceeds"), "{error:#}");
+        }
+        let temp = distribution_fixture(&[(
+            "doctor-large-version".into(),
+            format!("2.0+{}", "a".repeat(INSPECTION_VERSION_LIMIT)),
+        )]);
+        let error = inspect_distributions(
+            temp.path(),
+            &[("doctor-large-version".into(), "2.0".parse().unwrap())],
+            true,
+            deadline,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("version exceeds"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_stdout_has_a_separate_fail_closed_bound() {
+        for size in [
+            OUTPUT_LIMIT + 1,
+            INSPECTION_BATCH_LIMIT,
+            INSPECTION_BATCH_LIMIT + 1,
+        ] {
+            let mut command = Command::new("head");
+            command.args(["-c", &size.to_string(), "/dev/zero"]);
+            let result = run_command_with_stdout_limit(
+                &mut command,
+                Instant::now() + Duration::from_secs(3),
+                || Ok(()),
+                Some(INSPECTION_BATCH_LIMIT),
+            );
+            if size <= INSPECTION_BATCH_LIMIT {
+                assert_eq!(result.unwrap()._stdout.len(), size);
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("response exceeds")
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_uses_the_existing_deadline() {
+        let error = inspect_distributions(
+            Path::new("missing-doctor-root"),
+            &[("doctor-demo".into(), "2.0".parse().unwrap())],
+            true,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("time limit"));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -760,7 +1073,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timeout_and_cancellation_stop_commands_and_descendants() {
-        for cancel in [false, true] {
+        for (cancel, stdout_limit) in [
+            (false, None),
+            (true, None),
+            (false, Some(INSPECTION_BATCH_LIMIT)),
+            (true, Some(INSPECTION_BATCH_LIMIT)),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let marker = temp.path().join("escaped");
             let mut command = Command::new("sh");
@@ -768,12 +1086,17 @@ mod tests {
                 .args(["-c", "(sleep 0.5; touch \"$1\") & wait", "test"])
                 .arg(&marker);
             let start = Instant::now();
-            let result = run_command(&mut command, start + Duration::from_millis(150), || {
-                if cancel && start.elapsed() > Duration::from_millis(40) {
-                    bail!("cancelled")
-                }
-                Ok(())
-            });
+            let result = run_command_with_stdout_limit(
+                &mut command,
+                start + Duration::from_millis(150),
+                || {
+                    if cancel && start.elapsed() > Duration::from_millis(40) {
+                        bail!("cancelled")
+                    }
+                    Ok(())
+                },
+                stdout_limit,
+            );
             assert!(result.is_err());
             assert!(start.elapsed() < Duration::from_secs(2));
             thread::sleep(Duration::from_millis(600));

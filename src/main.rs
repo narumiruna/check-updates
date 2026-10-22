@@ -275,6 +275,7 @@ fn collect(args: &Args) -> Result<Collected> {
         }
         for name in settings.packages.keys() {
             let age = cutoff(now, settings.package_policy(name, &cli).cooldown)?;
+            policy_lock |= age.is_some();
             if let Some(previous) = ages.insert(name.clone(), age) {
                 age_conflict |= previous != age;
             }
