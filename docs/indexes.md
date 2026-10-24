@@ -30,6 +30,8 @@ Index sources with `extra = "cpu"` apply only to occurrences in `[project.option
 
 For named indexes, supply HTTP Basic credentials using `UV_INDEX_INTERNAL_USERNAME` and `UV_INDEX_INTERNAL_PASSWORD` (uppercase the index name and replace every non-alphanumeric character with an underscore). Alternatively, credentials can be URL-encoded in the URL userinfo; environment credentials override URL credentials. Prefer the named-index environment method so secrets do not appear in shell history or process arguments. The `authenticate` setting accepts `auto` (the default), `always`, or `never`. `auto` uses URL or named environment credentials when present. `always` requires these credentials before a request. `never` rejects URL or named environment credentials before a request and otherwise sends no `Authorization` header. Unknown values are errors. These rules also apply to named sources. No credential providers are used.
 
+Verification and Doctor reject index URLs with embedded credentials, even over HTTPS. For these modes, use named-index environment credentials and configure indexes in `[[tool.uv.index]]`; see [Verified updates](locking.md#verified-updates).
+
 Authenticated requests require HTTPS. Explicit ports must be between `1` and `65535`; port `0` is rejected before a request. URLs with queries or fragments are rejected. Cross-origin redirects and HTTPS downgrades are rejected; same-origin redirects retain authentication.
 
 Index errors and diagnostic messages do not expose credentials or private response bodies. Output links omit URL userinfo. Paths and package names can still be sensitive. Private-index metadata is kept only in memory for the invocation and is never written to disk.

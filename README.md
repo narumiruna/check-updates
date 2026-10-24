@@ -19,7 +19,7 @@ uvx check-updates -u
 
 After writing updates, the command runs `uv lock` if the selected project root already has `uv.lock`. Use `--no-lock` with `-u` or `-i` to update requirements only. Lock failures leave requirement changes in place; review the files and run `uv lock` after correcting the error.
 
-Normal modes do not install packages or run `uv sync`. Review the changes and test your project. Run `uv sync` when ready to install packages. See [locking and verification](docs/locking.md) for details.
+Normal modes do not install packages or run `uv sync`. Review the changes and test your project. Run `uv sync` when ready to install packages. See [locking and verification](https://github.com/narumiruna/check-updates/blob/main/docs/locking.md) for details.
 
 ## Installation
 
@@ -32,7 +32,7 @@ uv tool install check-updates
 pip install check-updates
 ```
 
-PyPI installation requires Python 3.10 or newer. Platform wheels contain a native Rust executable and do not require Rust. Source installs require Rust and a C compiler. See [supported platforms and installation details](docs/installation.md).
+PyPI installation requires Python 3.10 or newer. Platform wheels contain a native Rust executable and do not require Rust. Source installs require Rust and a C compiler. See [supported platforms and installation details](https://github.com/narumiruna/check-updates/blob/main/docs/installation.md).
 
 ## Common commands
 
@@ -61,16 +61,16 @@ uvx check-updates --help
 - Skips unsupported requirements, such as direct URLs and wildcard pins.
 - Compares declared requirements, not installed versions. An available update does not prove compatibility.
 
-Optional [verification and Doctor modes](docs/locking.md#verified-updates) can resolve updates before writing. Doctor also installs dependencies and runs your test command in a temporary project. It executes code with your permissions; it is not a security sandbox.
+Optional [verification and Doctor modes](https://github.com/narumiruna/check-updates/blob/main/docs/locking.md#verified-updates) can resolve updates before writing. Doctor also installs dependencies and runs your test command in a temporary project. It executes code with your permissions; it is not a security sandbox.
 
 ## Documentation
 
 | Guide | Contents |
 | --- | --- |
-| [Installation](docs/installation.md) | Supported platforms, Python requirements, and Cargo installation |
-| [Usage](docs/usage.md) | CLI options, package selection, interactive controls, and workspaces |
-| [Update policies](docs/policies.md) | Saved configuration, cooldowns, prereleases, and decision reports |
-| [Locking and verification](docs/locking.md) | Automatic locking, verified updates, Doctor, and recovery |
-| [Output and limitations](docs/reference.md) | JSON schemas, CI, exit codes, and supported requirements |
-| [Package indexes](docs/indexes.md) | Private indexes, authentication, caching, and retries |
-| [Development](docs/development.md) | Build, test, and release checks |
+| [Installation](https://github.com/narumiruna/check-updates/blob/main/docs/installation.md) | Supported platforms, Python requirements, and Cargo installation |
+| [Usage](https://github.com/narumiruna/check-updates/blob/main/docs/usage.md) | CLI options, package selection, interactive controls, and workspaces |
+| [Update policies](https://github.com/narumiruna/check-updates/blob/main/docs/policies.md) | Saved configuration, cooldowns, prereleases, and decision reports |
+| [Locking and verification](https://github.com/narumiruna/check-updates/blob/main/docs/locking.md) | Automatic locking, verified updates, Doctor, and recovery |
+| [Output and limitations](https://github.com/narumiruna/check-updates/blob/main/docs/reference.md) | JSON schemas, CI, exit codes, and supported requirements |
+| [Package indexes](https://github.com/narumiruna/check-updates/blob/main/docs/indexes.md) | Private indexes, authentication, caching, and retries |
+| [Development](https://github.com/narumiruna/check-updates/blob/main/docs/development.md) | Build, test, and release checks |
