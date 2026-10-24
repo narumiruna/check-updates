@@ -73,4 +73,6 @@ Optional [verification and Doctor modes](https://github.com/narumiruna/check-upd
 | [Locking and verification](https://github.com/narumiruna/check-updates/blob/main/docs/locking.md) | Automatic locking, verified updates, Doctor, and recovery |
 | [Output and limitations](https://github.com/narumiruna/check-updates/blob/main/docs/reference.md) | JSON schemas, CI, exit codes, and supported requirements |
 | [Package indexes](https://github.com/narumiruna/check-updates/blob/main/docs/indexes.md) | Private indexes, authentication, caching, and retries |
+| [Workflows](https://github.com/narumiruna/check-updates/blob/main/docs/workflows.md) | Review, apply, verify, test, and automate updates |
+| [Architecture](https://github.com/narumiruna/check-updates/blob/main/docs/architecture.md) | Rust modules, data flow, and execution boundaries |
 | [Development](https://github.com/narumiruna/check-updates/blob/main/docs/development.md) | Build, test, and release checks |

@@ -30,4 +30,4 @@ If a release needs provider-specific private-index verification, the index owner
 
 ## Related documentation
 
-[Installation](installation.md)
+[Installation](installation.md) · [Architecture](architecture.md) · [Workflows](workflows.md)
