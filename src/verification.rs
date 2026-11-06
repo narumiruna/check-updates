@@ -9,19 +9,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread::sleep;
+use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use pep440_rs::Version;
 use pep508_rs::{Requirement, VersionOrUrl};
 use tempfile::{NamedTempFile, TempDir};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
-use crate::changes::{self, Change, safe_text};
-use crate::dependencies::{dependencies, normalize};
+use crate::changes::{self, Change};
+use crate::dependencies;
 use crate::output::Pending;
 use crate::workspace::Project;
 
@@ -205,7 +206,7 @@ fn controlled_environment(command: &mut Command) -> Result<()> {
 }
 
 struct Running {
-    child: std::process::Child,
+    child: Child,
     finished: bool,
 }
 impl Running {
@@ -213,9 +214,12 @@ impl Running {
         if self.finished {
             return;
         }
+        // Child::kill cannot stop descendants; the standard library has no safe
+        // API to signal a process group.
+        // SAFETY: run_uv assigns the child its own process group with its PID as
+        // the group ID. A negative PID targets that group, not the caller's group.
         #[cfg(unix)]
         unsafe {
-            // A dedicated process group also contains backend/helper descendants.
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
         let _ = self.child.kill();
@@ -250,8 +254,8 @@ fn run_uv(directory: &Path, args: &[String], deadline: Instant) -> Result<String
             .context("Cannot start uv for verification")?,
         finished: false,
     };
-    let mut stdout = Capture::new(child.child.stdout.take().context("Missing uv stdout")?)?;
-    let mut stderr = Capture::new(child.child.stderr.take().context("Missing uv stderr")?)?;
+    let mut stdout = Capture::try_new(child.child.stdout.take().context("Missing uv stdout")?)?;
+    let mut stderr = Capture::try_new(child.child.stderr.take().context("Missing uv stderr")?)?;
     let status = loop {
         budget(deadline)?;
         stdout.drain(deadline)?;
@@ -263,7 +267,7 @@ fn run_uv(directory: &Path, args: &[String], deadline: Instant) -> Result<String
         {
             break status;
         }
-        sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(25));
     };
     // No reader waits for EOF: a descendant can retain an inherited pipe even
     // after the direct child exits or leaves its process group.
@@ -286,6 +290,9 @@ trait Pipe: Read {
 #[cfg(unix)]
 impl<T: Read + std::os::fd::AsRawFd> Pipe for T {
     fn initialize(&self) -> std::io::Result<()> {
+        // The standard library has no safe API to make child pipes nonblocking.
+        // SAFETY: self keeps the pipe descriptor live for both fcntl calls. These
+        // commands read and change status flags; they do not access pointers.
         unsafe {
             let flags = libc::fcntl(self.as_raw_fd(), libc::F_GETFL);
             if flags < 0
@@ -307,6 +314,8 @@ impl<T: Read + std::os::windows::io::AsRawHandle> Pipe for T {
         Ok(())
     }
     fn available(&self) -> std::io::Result<usize> {
+        // The standard library has no safe API to inspect available bytes in a
+        // Windows child pipe without blocking.
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn PeekNamedPipe(
@@ -319,6 +328,8 @@ impl<T: Read + std::os::windows::io::AsRawHandle> Pipe for T {
             ) -> i32;
         }
         let mut available = 0;
+        // SAFETY: self keeps the pipe handle live. available is writable for this
+        // call; the null buffer and optional outputs are valid for a zero-byte peek.
         let success = unsafe {
             PeekNamedPipe(
                 self.as_raw_handle(),
@@ -345,7 +356,7 @@ struct Capture<T> {
     bytes: Vec<u8>,
 }
 impl<T: Pipe> Capture<T> {
-    fn new(pipe: T) -> Result<Self> {
+    fn try_new(pipe: T) -> Result<Self> {
         pipe.initialize()
             .context("Cannot initialize nonblocking uv output")?;
         Ok(Self {
@@ -439,7 +450,7 @@ fn check_project(project: &Project) -> Result<()> {
         doc.get("project").and_then(|p| p.get("dynamic")).is_none(),
         "Verification does not support dynamic project metadata"
     );
-    for dependency in dependencies(doc) {
+    for dependency in dependencies::dependencies(doc) {
         let requirement: Requirement = dependency.requirement.parse().map_err(|_| {
             anyhow::anyhow!("Verification requires static, valid dependency requirements")
         })?;
@@ -1061,7 +1072,7 @@ impl Prepared {
                     .requirement
                     .parse()
                     .map_err(|_| anyhow::anyhow!("Invalid selected dependency requirement"))?;
-                let name = normalize(requirement.name.as_ref());
+                let name = dependencies::normalize(requirement.name.as_ref());
                 if let Some(previous) = selected.insert(name, update.version.clone()) {
                     ensure!(
                         previous == update.version,
@@ -1116,7 +1127,7 @@ impl Prepared {
                     && requirement.marker.is_true(),
                 "Package cutoff requires a plain package name"
             );
-            let name = normalize(requirement.name.as_ref());
+            let name = dependencies::normalize(requirement.name.as_ref());
             ensure!(
                 package_cutoffs.insert(name.clone()),
                 "Duplicate normalized package cutoff"
@@ -1291,7 +1302,7 @@ fn validate_lock(
             }
         }
         if let Some(selected) = selected {
-            let name = normalize(
+            let name = dependencies::normalize(
                 package
                     .get("name")
                     .and_then(Item::as_str)
@@ -1386,7 +1397,7 @@ impl Verified {
             let mut unrestored = Vec::new();
             for (path, before, bytes) in written.into_iter().rev() {
                 if guarded_replace(path, bytes, before).is_err() {
-                    unrestored.push(safe_text(&path.to_string_lossy(), false));
+                    unrestored.push(changes::safe_text(&path.to_string_lossy(), false));
                 }
             }
             if unrestored.is_empty() {
@@ -1402,6 +1413,8 @@ impl Verified {
 }
 
 fn guarded_replace(path: &Path, before: &[u8], after: &[u8]) -> Result<()> {
+    use std::io::Write;
+
     no_symlink_components(path)?;
     ensure!(
         regular_bytes(path)?.as_deref() == Some(before),
@@ -1409,7 +1422,6 @@ fn guarded_replace(path: &Path, before: &[u8], after: &[u8]) -> Result<()> {
     );
     let mut replacement =
         NamedTempFile::new_in(path.parent().context("Application path has no parent")?)?;
-    use std::io::Write;
     replacement
         .as_file()
         .set_permissions(fs::metadata(path)?.permissions())?;

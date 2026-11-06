@@ -2,24 +2,27 @@
 
 use anyhow::{Result, anyhow, bail};
 use pep440_rs::Version;
-use percent_encoding::percent_decode_str;
+use regex::Regex;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::redirect::Policy;
+use reqwest::retry;
 use reqwest::{Client, ClientBuilder, Request};
 use scraper::{Html, Selector};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{
-    LazyLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::runtime::{Builder, Runtime};
 use url::Url;
+
+use crate::Interrupted;
 
 const CACHE_TTL: f64 = 3600.0;
 const CACHE_VERSION: u64 = 2;
@@ -79,8 +82,7 @@ fn normalize(name: &str) -> String {
 
 fn printable_url(value: &str) -> bool {
     // Python str.isprintable excludes Unicode separators and format characters.
-    static NONPRINTABLE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"[\p{C}\p{Z}]").unwrap());
+    static NONPRINTABLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{C}\p{Z}]").unwrap());
     !NONPRINTABLE.is_match(value)
 }
 
@@ -100,10 +102,10 @@ impl Index {
         if !matches!(self.authenticate.as_str(), "auto" | "always" | "never") {
             bail!(INVALID_INDEX);
         }
-        let mut username = percent_decode_str(parsed.username())
+        let mut username = percent_encoding::percent_decode_str(parsed.username())
             .decode_utf8_lossy()
             .into_owned();
-        let mut password = percent_decode_str(parsed.password().unwrap_or(""))
+        let mut password = percent_encoding::percent_decode_str(parsed.password().unwrap_or(""))
             .decode_utf8_lossy()
             .into_owned();
         if let Some(name) = self.name.as_ref().filter(|name| !name.is_empty()) {
@@ -212,8 +214,8 @@ fn client_builder() -> ClientBuilder {
         // Match urllib's one-connection-per-request behavior.
         .pool_max_idle_per_host(0)
         // Retrying here, not inside reqwest, bounds the total number of attempts.
-        .retry(reqwest::retry::never())
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .retry(retry::never())
+        .redirect(Policy::custom(|attempt| {
             let target = attempt.url();
             if attempt.previous().len() >= 10 {
                 return attempt.error("Too many index redirects.");
@@ -229,7 +231,7 @@ fn client_builder() -> ClientBuilder {
         }))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum ReadError {
     Http(u16),
     Network,
@@ -353,7 +355,7 @@ impl ReleaseClient {
             let (request, link) = index.request(name, &self.http)?;
             let (body, content_type) = match self.read(request, interrupted) {
                 Ok(response) => response,
-                Err(ReadError::Interrupted) => return Err(crate::Interrupted.into()),
+                Err(ReadError::Interrupted) => return Err(Interrupted.into()),
                 Err(ReadError::Http(404)) => continue,
                 Err(ReadError::Http(code)) => {
                     bail!("Index lookup failed for {name} (HTTP {code}).")
@@ -408,7 +410,7 @@ impl ReleaseClient {
             .map_err(|_| anyhow!("Invalid public PyPI URL."))?;
         let (body, _) = match self.read(request, interrupted) {
             Ok(response) => response,
-            Err(ReadError::Interrupted) => return Err(crate::Interrupted.into()),
+            Err(ReadError::Interrupted) => return Err(Interrupted.into()),
             Err(ReadError::Http(404)) => bail!(
                 "Package {name} was not found on public PyPI (HTTP 404). Check the package name; it may be private or unpublished. Use --index or configure tool.uv.index for private packages. For uv workspace dependencies, declare workspace = true in [tool.uv.sources] and use -w to include workspace root sources and check members. No files were written."
             ),
@@ -610,7 +612,8 @@ fn simple_candidates_metadata(body: &[u8], content_type: &str, name: &str) -> Re
             let href = anchor.value().attr("href")?;
             if href.is_empty() { return None; }
             let path = href.split('#').next()?.split('?').next()?;
-            let filename = percent_decode_str(path.rsplit('/').next()?).decode_utf8_lossy();
+            let filename =
+                percent_encoding::percent_decode_str(path.rsplit('/').next()?).decode_utf8_lossy();
             Some(json!({"filename": filename, "requires-python": anchor.value().attr("data-requires-python"), "upload-time": anchor.value().attr("data-upload-time"), "yanked": anchor.value().attr("data-yanked").is_some()}))
         }).collect();
         simple_candidates(&Value::Array(files), name)
@@ -729,6 +732,8 @@ fn now() -> f64 {
 }
 
 fn cache_path_from(name: &str, xdg: Option<&OsStr>, home: Option<PathBuf>) -> Option<PathBuf> {
+    use sha2::Digest;
+
     let root = xdg
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -789,13 +794,12 @@ fn load_cache(path: &PathBuf, now: f64) -> Option<Metadata> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::io::ErrorKind;
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
 
     // Local TCP fixtures keep HTTP, redirect, and truncated-body tests offline.
     struct Server {
@@ -807,6 +811,8 @@ mod tests {
 
     impl Server {
         fn new(responses: impl FnOnce(&str) -> Vec<String>) -> Self {
+            use std::io::{Read, Write};
+
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -819,7 +825,7 @@ mod tests {
                 while !stopped.load(Ordering::SeqCst) {
                     let (mut stream, _) = match listener.accept() {
                         Ok(stream) => stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
                             continue;
                         }
@@ -851,7 +857,7 @@ mod tests {
                     let _ = stream.write_all(response.as_bytes());
                     // Send FIN after the response, then drain the peer before closing.
                     // An immediate close can send RST and discard the response on macOS.
-                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let _ = stream.shutdown(Shutdown::Write);
                     while stream.read(&mut buffer).unwrap_or(0) != 0 {}
                 }
             });
@@ -1003,6 +1009,8 @@ mod tests {
 
     #[test]
     fn fractional_upload_times_cannot_cross_the_inclusive_cooldown_boundary() {
+        use crate::selection::{self, CandidatePolicy};
+
         for (timestamp, eligible) in [
             ("1970-01-01T00:00:02Z", true),
             ("1970-01-01T00:00:02.000001Z", false),
@@ -1013,12 +1021,12 @@ mod tests {
             let releases =
                 simple_candidates_metadata(data.to_string().as_bytes(), "application/json", "demo")
                     .unwrap();
-            let policy = crate::selection::CandidatePolicy {
+            let policy = CandidatePolicy {
                 cutoff: Some(2),
                 ..Default::default()
             };
             let decision =
-                crate::selection::evaluate(&"demo>=1".parse().unwrap(), &releases, &policy, None);
+                selection::evaluate(&"demo>=1".parse().unwrap(), &releases, &policy, None);
             assert_eq!(decision.selected.is_some(), eligible, "{timestamp}");
         }
     }
@@ -1142,7 +1150,7 @@ mod tests {
             let _ = wait.recv_timeout(Duration::from_secs(2));
         });
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         drop(client);
         assert!(start.elapsed() < Duration::from_secs(1));
         release.send(()).unwrap();
@@ -1165,11 +1173,11 @@ mod tests {
                 &interrupted,
             )
             .unwrap_err();
-        assert!(private_error.downcast_ref::<crate::Interrupted>().is_some());
+        assert!(private_error.downcast_ref::<Interrupted>().is_some());
         let public_error = client
             .public_from_with_interrupt("demo", &server.url, Some(cache.clone()), &interrupted)
             .unwrap_err();
-        assert!(public_error.downcast_ref::<crate::Interrupted>().is_some());
+        assert!(public_error.downcast_ref::<Interrupted>().is_some());
         assert_eq!(server.count(), 0);
         assert_eq!(fallback.count(), 0);
         assert!(!cache.exists());
@@ -1185,7 +1193,7 @@ mod tests {
             let flag = interrupted.clone();
             let requests = server.requests.clone();
             let trigger = thread::spawn(move || {
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 while requests.lock().unwrap().is_empty() {
                     assert!(
                         started.elapsed() < Duration::from_secs(2),
@@ -1199,7 +1207,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let cache = temp.path().join("cache.json");
             let mut client = client(false);
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let error = if public {
                 client
                     .public_from_with_interrupt(
@@ -1220,7 +1228,7 @@ mod tests {
             };
             trigger.join().unwrap();
             assert!(started.elapsed() < Duration::from_secs(2));
-            assert!(error.downcast_ref::<crate::Interrupted>().is_some());
+            assert!(error.downcast_ref::<Interrupted>().is_some());
             assert_eq!(error.to_string(), "Interrupted.");
             assert_eq!(server.count(), 1);
             assert_eq!(fallback.count(), 0);
@@ -1703,7 +1711,7 @@ mod tests {
             .build()
             .unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let error = client.get("demo", &[index(&url)]).unwrap_err();
         assert_eq!(
             format!("{error:?}"),

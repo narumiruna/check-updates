@@ -4,10 +4,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
-use pep508_rs::Requirement;
+use glob::Pattern;
+use pep508_rs::{PackageName, Requirement};
 use toml_edit::{Item, TableLike};
 
-use crate::dependencies::{Dependency, normalize};
+use crate::dependencies::{self, Dependency};
 use crate::selection::Selection;
 use crate::workspace::Project;
 
@@ -119,9 +120,9 @@ impl Settings {
                         .as_table_like()
                         .context("Policy packages must be a table.")?;
                     for (name, value) in packages.iter() {
-                        let name = normalize(name);
+                        let name = dependencies::normalize(name);
                         ensure!(
-                            name.parse::<pep508_rs::PackageName>().is_ok(),
+                            name.parse::<PackageName>().is_ok(),
                             "Invalid policy package name."
                         );
                         let fields = value
@@ -193,7 +194,7 @@ impl Settings {
             .flatten()
         {
             for pattern in patterns {
-                glob::Pattern::new(&normalize(pattern)).context("Invalid package glob.")?;
+                Pattern::new(&dependencies::normalize(pattern)).context("Invalid package glob.")?;
             }
         }
         Ok(())
@@ -215,15 +216,16 @@ impl Settings {
     }
 
     pub fn accepts(&self, dependency: &Dependency, requirement: &Requirement) -> bool {
-        let name = normalize(requirement.name.as_ref());
+        let name = dependencies::normalize(requirement.name.as_ref());
         let exact = |list: &Option<Vec<String>>| {
             list.as_ref()
-                .is_some_and(|list| list.iter().any(|n| normalize(n) == name))
+                .is_some_and(|list| list.iter().any(|n| dependencies::normalize(n) == name))
         };
         let pattern = |list: &Option<Vec<String>>| {
             list.as_ref().is_some_and(|list| {
-                list.iter()
-                    .any(|p| glob::Pattern::new(&normalize(p)).is_ok_and(|p| p.matches(&name)))
+                list.iter().any(|p| {
+                    Pattern::new(&dependencies::normalize(p)).is_ok_and(|p| p.matches(&name))
+                })
             })
         };
         if exact(&self.exclude) || pattern(&self.exclude_glob) {
@@ -235,7 +237,10 @@ impl Settings {
             return false;
         }
         let names = |list: &Option<Vec<String>>| -> HashSet<String> {
-            list.iter().flatten().map(|v| normalize(v)).collect()
+            list.iter()
+                .flatten()
+                .map(|v| dependencies::normalize(v))
+                .collect()
         };
         Selection {
             groups: names(&self.group),
@@ -254,7 +259,7 @@ pub fn selected_members(projects: &[Project], requested: &[String]) -> Result<Ha
     }
     let mut result = HashSet::new();
     for name in requested {
-        let name = normalize(name);
+        let name = dependencies::normalize(name);
         let matches: Vec<_> = projects
             .iter()
             .filter(|p| {
@@ -262,7 +267,7 @@ pub fn selected_members(projects: &[Project], requested: &[String]) -> Result<Ha
                     .get("project")
                     .and_then(|p| p.get("name"))
                     .and_then(Item::as_str)
-                    .is_some_and(|v| normalize(v) == name)
+                    .is_some_and(|v| dependencies::normalize(v) == name)
             })
             .collect();
         ensure!(

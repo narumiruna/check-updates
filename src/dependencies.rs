@@ -1,10 +1,11 @@
 //! Read dependency occurrences and update their declared version floors.
 
-use anyhow::{Context, Result, ensure};
+use std::sync::LazyLock;
+
+use anyhow::{Result, ensure};
 use pep440_rs::{Operator, Version, VersionSpecifier};
 use pep508_rs::{Requirement, VersionOrUrl};
 use regex::Regex;
-use std::sync::LazyLock;
 use toml_edit::{DocumentMut, Item, Value};
 
 #[derive(Clone, Debug)]
@@ -206,6 +207,8 @@ pub fn replacement(requirement: &Requirement, original: &str, latest: &Version) 
 /// Replace one explicit upper bound in a supported floor-and-bounds requirement.
 /// Keep all other tokens, including exclusions and markers, unchanged.
 pub fn replacement_bound(requirement: &Requirement, original: &str, bound: &str) -> Result<String> {
+    use anyhow::Context;
+
     let bound = bound
         .parse::<VersionSpecifier>()
         .context("Invalid replacement upper bound")?;
@@ -304,6 +307,8 @@ pub fn version_change(update: &Update) -> &'static str {
 
 /// Replace one occurrence and keep its string delimiters and TOML decoration.
 pub fn apply_update(document: &mut DocumentMut, update: &Update) -> Result<()> {
+    use anyhow::Context;
+
     let mut item = document.as_item_mut();
     for key in &update.dependency.section {
         item = item.get_mut(key).with_context(|| {

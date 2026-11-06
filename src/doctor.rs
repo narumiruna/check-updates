@@ -18,11 +18,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use pep440_rs::Version;
 
+use crate::changes;
 use crate::output::Pending;
 use crate::verification::{self, Prepared, ResolvePolicy, Verified};
 use crate::workspace::Project;
-use crate::{changes, check_interrupt};
 
 const MAX_ATTEMPTS: usize = 32; // Includes baseline and final confirmation.
 const MAX_RUNTIME: Duration = Duration::from_secs(10 * 60);
@@ -229,7 +230,7 @@ fn select_subset(
 }
 
 fn check_budget(deadline: Instant) -> Result<()> {
-    check_interrupt().context("Doctor evaluation incomplete; no updates were applied")?;
+    crate::check_interrupt().context("Doctor evaluation incomplete; no updates were applied")?;
     ensure!(
         Instant::now() < deadline,
         "Doctor time limit reached; evaluation incomplete and no updates were applied"
@@ -363,7 +364,7 @@ fn test_verified(
 // Structured data has its own strict bound. Diagnostic retention must not cut JSON.
 fn inspect_distributions(
     directory: &Path,
-    names: &[(String, pep440_rs::Version)],
+    names: &[(String, Version)],
     exact: bool,
     deadline: Instant,
 ) -> Result<bool> {
@@ -459,7 +460,7 @@ sys.stdout.write('[' + ','.join(records) + ']')
                 name == &returned,
                 "Invalid Doctor structured inspection record"
             );
-            let actual = version.and_then(|v| v.parse::<pep440_rs::Version>().ok());
+            let actual = version.and_then(|v| v.parse::<Version>().ok());
             if actual.is_none() || exact && actual.as_ref() != Some(expected) {
                 return Ok(false);
             }
@@ -537,7 +538,8 @@ impl Drop for ChildGuard {
 
 #[cfg(unix)]
 fn stop_child(child: &mut Child) {
-    #[cfg(unix)]
+    // Child::kill cannot stop descendants; the standard library has no safe API
+    // to signal a process group.
     // SAFETY: the child created a new process group with its own PID. A negative
     // PID targets only that group, not the invoking process's group.
     unsafe {
@@ -565,10 +567,8 @@ fn run_command_with_stdout_limit(
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn reader(
         mut pipe: impl Read + AsRawFd + Send + 'static,
@@ -577,8 +577,10 @@ fn run_command_with_stdout_limit(
         strict: bool,
     ) -> Result<thread::JoinHandle<Result<Vec<u8>>>> {
         let fd = pipe.as_raw_fd();
-        // SAFETY: fd is a live pipe owned by this reader; only status flags change.
+        // The standard library has no safe API to make child pipes nonblocking.
+        // SAFETY: fd is a live pipe owned by this reader; F_GETFL reads its flags.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: fd remains live; F_SETFL changes only its status flags.
         ensure!(
             flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
             "Cannot make Doctor diagnostics nonblocking"

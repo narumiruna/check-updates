@@ -1,13 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::changes::safe_text;
-use crate::workspace::read_project;
+use crate::changes;
+use crate::workspace;
 
 fn parent_workspace(directory: &Path) -> Result<Option<PathBuf>> {
     for candidate in directory.ancestors() {
@@ -15,7 +15,7 @@ fn parent_workspace(directory: &Path) -> Result<Option<PathBuf>> {
         if !path.is_file() {
             continue;
         }
-        let project = read_project(&path)?;
+        let project = workspace::read_project(&path)?;
         if project
             .document
             .get("tool")
@@ -33,7 +33,7 @@ pub fn lock_project(directory: &Path) -> Result<()> {
     let directory = directory.canonicalize()?;
     let recovery = format!(
         "Requirement files were updated. uv.lock may be stale or changed. Resolve the error and run uv lock in {}, or review and restore the affected files.",
-        safe_text(&directory.to_string_lossy(), false)
+        changes::safe_text(&directory.to_string_lossy(), false)
     );
     lock_inner(&directory).with_context(|| recovery)
 }
@@ -48,13 +48,13 @@ fn lock_inner(directory: &Path) -> Result<()> {
     if let Some(parent) = parent_workspace(directory)? {
         eprintln!(
             "Skipping uv lock: parent workspace found at {}. Requirement files were updated; lockfiles were not changed. Use -w to update and lock the workspace, or review and lock manually.",
-            safe_text(&parent.to_string_lossy(), false)
+            changes::safe_text(&parent.to_string_lossy(), false)
         );
         return Ok(());
     }
     println!(
         "Running uv lock in {}...",
-        safe_text(&directory.to_string_lossy(), false)
+        changes::safe_text(&directory.to_string_lossy(), false)
     );
     let mut child = Command::new("uv")
         .arg("lock")
@@ -79,7 +79,7 @@ fn lock_inner(directory: &Path) -> Result<()> {
             println!("uv lock completed.");
             return Ok(());
         }
-        sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

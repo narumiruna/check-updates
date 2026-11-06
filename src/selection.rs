@@ -1,11 +1,12 @@
 //! Filter dependency occurrences and choose releases without dependency resolution.
 
-use anyhow::{Context, Result, bail, ensure};
-use pep440_rs::{Operator, Version, VersionSpecifier, VersionSpecifiers};
-use pep508_rs::Requirement;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::dependencies::{Dependency, baseline, normalize, specifiers, unsupported_reason};
+use anyhow::{Result, bail, ensure};
+use pep440_rs::{Operator, Version, VersionSpecifier, VersionSpecifiers};
+use pep508_rs::{Requirement, VersionOrUrl};
+
+use crate::dependencies::{self, Dependency};
 use crate::indexes::Release;
 
 #[derive(Clone, Debug)]
@@ -34,9 +35,11 @@ impl Default for Selection {
 impl Selection {
     pub fn accepts(&self, dependency: &Dependency, requirement: &Requirement) -> bool {
         fn contains(names: &HashSet<String>, name: &str) -> bool {
-            names.iter().any(|candidate| normalize(candidate) == name)
+            names
+                .iter()
+                .any(|candidate| dependencies::normalize(candidate) == name)
         }
-        let name = normalize(requirement.name.as_ref());
+        let name = dependencies::normalize(requirement.name.as_ref());
         if contains(&self.exclude, &name)
             || (!self.include.is_empty() && !contains(&self.include, &name))
         {
@@ -48,8 +51,10 @@ impl Selection {
         let section: Vec<&str> = dependency.section.iter().map(String::as_str).collect();
         match section.as_slice() {
             ["project", "dependencies"] => self.runtime,
-            ["dependency-groups", name] => contains(&self.groups, &normalize(name)),
-            ["project", "optional-dependencies", name] => contains(&self.extras, &normalize(name)),
+            ["dependency-groups", name] => contains(&self.groups, &dependencies::normalize(name)),
+            ["project", "optional-dependencies", name] => {
+                contains(&self.extras, &dependencies::normalize(name))
+            }
             _ => false,
         }
     }
@@ -87,16 +92,16 @@ fn specifiers_contain(specs: &VersionSpecifiers, version: &Version) -> bool {
 /// Match the full declared range, including compatible bounds and exclusions.
 /// URL requirements do not describe a version range.
 pub fn requirement_contains(requirement: &Requirement, version: &Version) -> bool {
-    !matches!(
-        requirement.version_or_url,
-        Some(pep508_rs::VersionOrUrl::Url(_))
-    ) && specifiers(requirement)
-        .iter()
-        .all(|spec| specifier_contains(spec, version))
+    !matches!(requirement.version_or_url, Some(VersionOrUrl::Url(_)))
+        && dependencies::specifiers(requirement)
+            .iter()
+            .all(|spec| specifier_contains(spec, version))
 }
 
 /// Use the declared inclusive Python floor. Never use the host interpreter.
 pub fn python_baseline(value: Option<&str>) -> Result<Option<Version>> {
+    use anyhow::Context;
+
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -238,11 +243,11 @@ pub fn evaluate(
         rejected: Vec::new(),
         reason: None,
     };
-    if unsupported_reason(requirement).is_some() {
+    if dependencies::unsupported_reason(requirement).is_some() {
         decision.reason = Some("unsupported_requirement");
         return decision;
     }
-    let spec = baseline(requirement);
+    let spec = dependencies::baseline(requirement);
     let before = spec.map(|spec| spec.version());
     let mut versions: BTreeMap<&Version, Vec<&Release>> = BTreeMap::new();
     for release in releases {
@@ -252,7 +257,7 @@ pub fn evaluate(
     }
     for (version, artifacts) in versions.into_iter().rev() {
         let mut shared = BTreeSet::new();
-        for spec in specifiers(requirement) {
+        for spec in dependencies::specifiers(requirement) {
             let reason = match spec.operator() {
                 Operator::LessThan | Operator::LessThanEqual => Rejection::UpperBound,
                 Operator::NotEqual | Operator::NotEqualStar => Rejection::Excluded,
@@ -363,7 +368,6 @@ pub fn choose_version(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dependencies::{replacement, unsupported_reason};
 
     fn version(value: &str) -> Version {
         value.parse().unwrap()
@@ -437,7 +441,10 @@ mod tests {
             ("demo>=1.0,<2,!=1.9", "1.8"),
             ("demo>=1.0,<2,!=1.9.*", "1.8"),
         ] {
-            assert_eq!(unsupported_reason(&requirement.parse().unwrap()), None);
+            assert_eq!(
+                dependencies::unsupported_reason(&requirement.parse().unwrap()),
+                None
+            );
             assert_eq!(
                 choose(requirement, &["1.8", "1.9", "2", "3"], "latest"),
                 Some(version(expected))
@@ -571,7 +578,7 @@ mod tests {
             let req: Requirement = original.parse().unwrap();
             let found = choose(original, &["1.2.4", "1.2.5+internal"], "latest").unwrap();
             assert_eq!(found, version("1.2.4"));
-            let updated = replacement(&req, original, &found).unwrap();
+            let updated = dependencies::replacement(&req, original, &found).unwrap();
             assert!(updated.parse::<Requirement>().is_ok());
             assert_eq!(choose(original, &["1.2.5+internal"], "latest"), None);
         }
@@ -584,7 +591,7 @@ mod tests {
         for target in ["patch", "minor", "latest"] {
             let found = choose(original, &["1.2.4", "1.2.5+internal"], target).unwrap();
             assert_eq!(found, version("1.2.5+internal"));
-            let updated = replacement(&req, original, &found).unwrap();
+            let updated = dependencies::replacement(&req, original, &found).unwrap();
             assert_eq!(updated, "demo==1.2.5+internal");
             assert!(updated.parse::<Requirement>().is_ok());
         }
