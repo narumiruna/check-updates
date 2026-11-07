@@ -1,10 +1,13 @@
 use std::fs;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow, ensure};
+use regex::{Captures, Regex};
 use similar::TextDiff;
 use toml_edit::{Document, Item, Value};
+use url::Url;
 
-use crate::dependencies::{Dependency, Update, apply_update};
+use crate::dependencies::{self, Dependency, Update};
 use crate::workspace::Project;
 
 #[derive(Debug)]
@@ -35,7 +38,7 @@ pub fn prepare_change<'a>(project: &'a Project, updates: &[Update]) -> Result<Ch
         let span = value_at(parsed.as_item(), &update.dependency)?
             .span()
             .context("Missing dependency source span")?;
-        apply_update(&mut document, update)?;
+        dependencies::apply_update(&mut document, update)?;
         let mut value = value_at(document.as_item(), &update.dependency)?.clone();
         value.decor_mut().clear();
         replacements.push((span, value.to_string()));
@@ -60,11 +63,10 @@ pub fn prepare_change<'a>(project: &'a Project, updates: &[Update]) -> Result<Ch
 
 /// Remove URL credentials and query data from diagnostic text, not project bytes.
 pub fn redact_urls(value: &str) -> String {
-    static URLS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+"#).unwrap()
-    });
-    URLS.replace_all(value, |captures: &regex::Captures<'_>| {
-        let Ok(mut url) = url::Url::parse(&captures[0]) else {
+    static URLS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+"#).unwrap());
+    URLS.replace_all(value, |captures: &Captures<'_>| {
+        let Ok(mut url) = Url::parse(&captures[0]) else {
             return "[redacted URL]".to_owned();
         };
         if url.set_username("").is_err() || url.set_password(None).is_err() {
@@ -141,6 +143,7 @@ pub fn write_changes(changes: &[Change<'_>]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace;
 
     #[test]
     fn diagnostic_urls_do_not_expose_credentials_queries_or_fragments() {
@@ -153,8 +156,6 @@ mod tests {
         );
         assert!(!redact_urls("https://secret@%invalid").contains("secret"));
     }
-    use crate::dependencies::dependencies;
-    use crate::workspace::read_project;
 
     #[test]
     fn edits_only_selected_occurrence_and_preserves_source_bytes() {
@@ -164,9 +165,9 @@ mod tests {
                 let path = temp.path().join("pyproject.toml");
                 let original = format!("[project]\ndependencies = [\"demo>=1.0\", {quote}demo>=1.0{quote}] # keep\n[dependency-groups]\ndev = [{{include-group = 'other'}}, 'demo>=1.0']").replace('\n', newline);
                 fs::write(&path, &original).unwrap();
-                let project = read_project(&path).unwrap();
+                let project = workspace::read_project(&path).unwrap();
                 let update = Update {
-                    dependency: dependencies(&project.document)[1].clone(),
+                    dependency: dependencies::dependencies(&project.document)[1].clone(),
                     replacement: "demo>=2.0".into(),
                     version: "2.0".parse().unwrap(),
                     release_link: None,
@@ -191,7 +192,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pyproject.toml");
         fs::write(&path, "[project]\ndependencies = []").unwrap();
-        let project = read_project(&path).unwrap();
+        let project = workspace::read_project(&path).unwrap();
         let change = Change {
             project: &project,
             content: b"new".to_vec(),

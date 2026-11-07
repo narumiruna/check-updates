@@ -1,23 +1,24 @@
-use std::collections::BTreeMap;
-use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::Display;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{CommandFactory, Parser, error::ErrorKind};
+use clap::Parser;
+use clap::error::ErrorKind;
 use pep440_rs::{Operator, Version};
 use pep508_rs::{Requirement, VersionOrUrl};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
-use check_updates::{
-    Interrupted, changes, dependencies, doctor,
-    indexes::ReleaseClient,
-    interactive, locked, locking, output,
-    policy::{self, Settings},
-    selection::{self, CandidatePolicy},
-    verification::{self, ResolvePolicy},
-    workspace,
-};
+use check_updates::dependencies::{self, Update};
+use check_updates::indexes::{Index, ReleaseClient};
+use check_updates::output::{self, Pending};
+use check_updates::policy::{self, Settings};
+use check_updates::selection::{self, CandidatePolicy};
+use check_updates::verification::{self, ResolvePolicy};
+use check_updates::workspace::{self, Project};
+use check_updates::{Interrupted, changes, doctor, interactive, locked, locking};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -126,12 +127,14 @@ fn parse_duration(value: &str) -> std::result::Result<u64, String> {
 }
 
 fn invalid(message: &str) -> ! {
+    use clap::CommandFactory;
+
     Args::command()
         .error(ErrorKind::ArgumentConflict, message)
         .exit()
 }
 
-fn debug(enabled: bool, message: impl std::fmt::Display) {
+fn debug(enabled: bool, message: impl Display) {
     if enabled {
         eprintln!("DEBUG: {}", changes::safe_text(&message.to_string(), false));
     }
@@ -207,8 +210,8 @@ fn named_constraints(values: &[String], bound: bool) -> Result<BTreeMap<String, 
 
 struct Collected {
     root: PathBuf,
-    projects: Vec<workspace::Project>,
-    pending: output::Pending,
+    projects: Vec<Project>,
+    pending: Pending,
     reports: Vec<Value>,
     resolver: ResolvePolicy,
     policy_lock: bool,
@@ -234,7 +237,7 @@ fn collect(args: &Args) -> Result<Collected> {
         .path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."))
+        .unwrap_or_else(|| Path::new("."))
         .canonicalize()?;
     let editable = policy::selected_members(&projects, &args.member)?;
     let cli = cli_settings(args);
@@ -242,9 +245,9 @@ fn collect(args: &Args) -> Result<Collected> {
     let root_settings = Settings::read(root)?;
     let to = named_constraints(&args.to, false)?;
     let bounds = named_constraints(&args.bound, true)?;
-    let mut matched_to = std::collections::HashSet::new();
-    let mut matched_bounds = std::collections::HashSet::new();
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut matched_to = HashSet::new();
+    let mut matched_bounds = HashSet::new();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
     let mut client = ReleaseClient::new(args.no_cache)?;
     let mut pending = Vec::new();
     let mut reports = Vec::new();
@@ -432,7 +435,7 @@ fn collect(args: &Args) -> Result<Collected> {
                     .as_ref()
                     .filter(|link| link.starts_with(&format!("https://pypi.org/project/{name}/")))
                     .and_then(|_| client.project_link(&name));
-                updates.push(dependencies::Update {
+                updates.push(Update {
                     dependency,
                     replacement,
                     version,
@@ -482,10 +485,10 @@ fn collect(args: &Args) -> Result<Collected> {
     })
 }
 
-fn report_indexes(indexes: &[check_updates::indexes::Index]) -> Vec<check_updates::indexes::Index> {
+fn report_indexes(indexes: &[Index]) -> Vec<Index> {
     let mut effective: Vec<_> = indexes.iter().filter(|i| !i.explicit).cloned().collect();
     if !indexes.iter().any(|i| i.default) {
-        effective.push(check_updates::indexes::Index {
+        effective.push(Index {
             url: "https://pypi.org/simple/".into(),
             ..Default::default()
         });
@@ -544,7 +547,7 @@ fn show_reports(reports: &[Value], show_locked: bool) {
 fn apply_selection(
     args: &Args,
     result: &Collected,
-    pending: &output::Pending,
+    pending: &Pending,
     interactive: bool,
 ) -> Result<()> {
     let changes: Vec<_> = pending
@@ -671,6 +674,8 @@ fn run(args: &Args) -> Result<i32> {
 }
 
 fn main() {
+    use std::io::IsTerminal;
+
     let args = Args::parse();
     if named_constraints(&args.to, false).is_err() || named_constraints(&args.bound, true).is_err()
     {
@@ -722,7 +727,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use check_updates::indexes::Index;
 
     #[test]
     fn locked_reporting_uses_the_same_implicit_public_fallback_as_lookup() {

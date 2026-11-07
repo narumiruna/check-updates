@@ -4,9 +4,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use glob::{MatchOptions, Pattern};
 use toml_edit::{DocumentMut, Item, TableLike};
 
-use crate::dependencies::normalize;
+use crate::dependencies;
 use crate::indexes::Index;
 
 #[derive(Clone, Debug)]
@@ -73,13 +74,13 @@ fn expand_pattern(directory: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
         bail!("Workspace glob patterns must be nonempty and relative: {pattern}");
     }
     // Escape the directory, not the user pattern: workspace paths can contain glob characters.
-    let directory = glob::Pattern::escape(
+    let directory = Pattern::escape(
         directory
             .to_str()
             .context("Workspace directory is not valid UTF-8.")?,
     );
     let pattern = format!("{directory}/{pattern}");
-    let options = glob::MatchOptions {
+    let options = MatchOptions {
         require_literal_separator: true,
         ..Default::default()
     };
@@ -215,7 +216,7 @@ fn sources<'a>(root: &'a Project, project: &'a Project) -> Result<HashMap<String
             .as_table_like()
             .context("tool.uv.sources must be a table.")?;
         for (name, value) in entries.iter() {
-            sources.insert(normalize(name), value);
+            sources.insert(dependencies::normalize(name), value);
         }
     }
     Ok(sources)
@@ -301,13 +302,13 @@ pub fn package_indexes(
     }
     let extra =
         if section.len() == 3 && section[0] == "project" && section[1] == "optional-dependencies" {
-            Some(normalize(&section[2]))
+            Some(dependencies::normalize(&section[2]))
         } else {
             None
         };
     let sources = sources(root, project)?;
     let mut names = HashSet::new();
-    if let Some(source) = sources.get(&normalize(name)) {
+    if let Some(source) = sources.get(&dependencies::normalize(name)) {
         for entry in source_entries(source) {
             let Some(index) = entry.get("index") else {
                 continue;
@@ -316,7 +317,7 @@ pub fn package_indexes(
                 let value = value
                     .as_str()
                     .context("Index source extra must be a string.")?;
-                if extra.as_deref() != Some(normalize(value).as_str()) {
+                if extra.as_deref() != Some(dependencies::normalize(value).as_str()) {
                     continue;
                 }
             }

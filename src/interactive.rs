@@ -1,27 +1,25 @@
 use std::collections::HashSet;
-use std::io::{Write, stdout};
+use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::{
-    cursor::{Hide, MoveTo, MoveToColumn, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
-    style::{Attribute, Print, SetAttribute},
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::cursor::{Hide, MoveTo, MoveToColumn, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 
-use crate::changes::safe_text;
-use crate::dependencies::version_change;
+use crate::changes;
+use crate::dependencies;
 use crate::output::Pending;
 
 struct Screen;
 
 impl Screen {
-    fn open() -> Result<Self> {
+    fn try_new() -> Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self;
-        execute!(stdout(), EnterAlternateScreen, Hide)?;
+        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
         Ok(guard)
     }
 }
@@ -29,7 +27,7 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         let _ = execute!(
-            stdout(),
+            io::stdout(),
             SetAttribute(Attribute::Reset),
             Show,
             LeaveAlternateScreen
@@ -94,10 +92,12 @@ impl Selector {
     }
 
     fn render(&self, pending: &Pending) -> Result<()> {
+        use std::io::Write;
+
         let (width, height) = terminal::size()?;
         let visible = usize::from(height.saturating_sub(3).max(1));
         let start = self.cursor.saturating_sub(visible - 1);
-        let mut output = stdout();
+        let mut output = io::stdout();
         execute!(
             output,
             MoveTo(0, 0),
@@ -122,7 +122,7 @@ impl Selector {
                     update.dependency.section.join("."),
                     update.dependency.requirement,
                     update.version,
-                    version_change(update)
+                    dependencies::version_change(update)
                 )
             } else {
                 let selected = (0..updates.len())
@@ -135,7 +135,7 @@ impl Selector {
                 )
             };
             // A single screen row per occurrence keeps scrolling and selection aligned.
-            let label: String = safe_text(&label, false)
+            let label: String = changes::safe_text(&label, false)
                 .chars()
                 .take(usize::from(width.saturating_sub(1)))
                 .collect();
@@ -155,7 +155,7 @@ impl Selector {
 }
 
 pub fn select_updates(pending: &Pending) -> Result<Pending> {
-    let _screen = Screen::open()?;
+    let _screen = Screen::try_new()?;
     let mut selector = Selector::new(pending);
     if selector.rows.is_empty() {
         return Ok(Vec::new());
@@ -194,7 +194,7 @@ impl Drop for Confirmation {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(
-            stdout(),
+            io::stdout(),
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             Show
@@ -203,14 +203,16 @@ impl Drop for Confirmation {
 }
 
 pub fn confirm_changes() -> Result<bool> {
+    use std::io::Write;
+
     // Keep the diff visible above the confirmation instead of opening another screen.
-    stdout().flush()?;
+    io::stdout().flush()?;
     terminal::enable_raw_mode()?;
     let _guard = Confirmation;
     let mut accepted = false;
     loop {
         execute!(
-            stdout(),
+            io::stdout(),
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             Print(format!(
@@ -218,7 +220,7 @@ pub fn confirm_changes() -> Result<bool> {
                 if accepted { "No / [Yes]" } else { "[No] / Yes" }
             ))
         )?;
-        stdout().flush()?;
+        io::stdout().flush()?;
         match read_key()?.code {
             KeyCode::Char('y' | 'Y') => return Ok(true),
             KeyCode::Esc | KeyCode::Char('n' | 'N') => return Ok(false),

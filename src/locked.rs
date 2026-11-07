@@ -1,14 +1,14 @@
 //! Read locked registry versions without checking freshness or invoking uv.
 
 use std::fs::{self, OpenOptions};
-use std::io::Read;
 use std::path::Path;
 
+use pep440_rs::Version;
 use serde_json::{Value, json};
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, Table};
 use url::Url;
 
-use crate::dependencies::normalize;
+use crate::dependencies;
 use crate::indexes::Index;
 
 fn report(state: &str, versions: Vec<Value>) -> Value {
@@ -18,10 +18,12 @@ fn report(state: &str, versions: Vec<Value>) -> Value {
 // Reject links and special files. Nonblocking, no-follow opens also protect
 // against a path being replaced with a FIFO or symlink before open on Unix.
 fn read_lock(path: &Path) -> Result<String, &'static str> {
+    use std::io::{ErrorKind, Read};
+
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => (),
         Ok(_) => return Err("unknown"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err("missing"),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Err("missing"),
         Err(_) => return Err("unknown"),
     }
     let mut options = OpenOptions::new();
@@ -43,7 +45,7 @@ fn read_lock(path: &Path) -> Result<String, &'static str> {
     }
     let mut text = String::new();
     file.read_to_string(&mut text).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::InvalidData {
+        if error.kind() == ErrorKind::InvalidData {
             "malformed"
         } else {
             "unknown"
@@ -71,7 +73,7 @@ fn registry_identity(value: &str) -> Option<String> {
     Some(url.as_str().trim_end_matches('/').to_owned())
 }
 
-fn markers(package: &toml_edit::Table) -> Option<Vec<String>> {
+fn markers(package: &Table) -> Option<Vec<String>> {
     match package.get("resolution-markers") {
         None => Some(Vec::new()),
         Some(item) => item
@@ -128,7 +130,7 @@ pub fn inspect(root: &Path, name: &str, indexes: &[Index]) -> Value {
         .iter()
         .filter_map(|index| registry_identity(&index.url))
         .collect();
-    let name = normalize(name);
+    let name = dependencies::normalize(name);
     let mut versions = Vec::new();
     let mut unknown = false;
     let mut mismatch = false;
@@ -136,7 +138,7 @@ pub fn inspect(root: &Path, name: &str, indexes: &[Index]) -> Value {
         let Some(package_name) = package.get("name").and_then(Item::as_str) else {
             return report("malformed", Vec::new());
         };
-        if normalize(package_name) != name {
+        if dependencies::normalize(package_name) != name {
             continue;
         }
         let Some(markers) = markers(package) else {
@@ -172,7 +174,7 @@ pub fn inspect(root: &Path, name: &str, indexes: &[Index]) -> Value {
         let Some(version) = package.get("version").and_then(Item::as_str) else {
             return report("malformed", Vec::new());
         };
-        if version.parse::<pep440_rs::Version>().is_err() {
+        if version.parse::<Version>().is_err() {
             return report("malformed", Vec::new());
         }
         if !allowed.contains(&registry) {
@@ -490,6 +492,8 @@ mod tests {
     #[test]
     fn symlinks_and_fifos_are_not_followed_or_opened() {
         use std::os::unix::fs::symlink;
+        use std::process::Command;
+
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
         fs::write(&target, format!("version = 1\n{}", package("1", PYPI, &[]))).unwrap();
@@ -500,10 +504,7 @@ mod tests {
             report("unknown", vec![])
         );
         fs::remove_file(&lock).unwrap();
-        let status = std::process::Command::new("mkfifo")
-            .arg(&lock)
-            .status()
-            .unwrap();
+        let status = Command::new("mkfifo").arg(&lock).status().unwrap();
         assert!(status.success());
         assert_eq!(
             inspect(temp.path(), "demo-pkg", &indexes(&[PYPI])),
