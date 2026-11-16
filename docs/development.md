@@ -22,6 +22,47 @@ uvx --isolated --no-index --find-links dist check-updates --version
 
 The Docker image contains the native CLI and uv for automatic locking. It does not require Python to run the CLI. Source installs and `uv build` compile Rust; platform wheel installs do not.
 
+## Git hooks
+
+Use prek with `prek.toml` for local Git hooks. If this checkout has an old pre-commit hook, follow [Migrate from pre-commit](#migrate-from-pre-commit) before running `prek install`.
+
+```sh
+uv tool install prek
+prek install
+prek run --all-files
+```
+
+### Migrate from pre-commit
+
+A hook installed with `pre-commit install` still reads the removed `.pre-commit-config.yaml`. It can block commits with a missing-config error. A plain `prek install` keeps the old hook as `pre-commit.legacy` in the active hook directory and runs it too, so the error can remain.
+
+Find the active Git hook directory from the checkout root:
+
+```sh
+git rev-parse --path-format=absolute --git-path hooks
+```
+
+This command accounts for `core.hooksPath` and linked worktrees. Use the returned directory for the checks below. To check the scope of a `core.hooksPath` setting, run `git config --show-scope --get core.hooksPath`.
+
+Choose one method:
+
+1. If pre-commit is still available and `core.hooksPath` is not set, remove any prek shim first, then replace the old hook. `prek uninstall` restores the legacy hook, if present, so `pre-commit uninstall` can remove it:
+
+   ```sh
+   prek uninstall
+   pre-commit uninstall
+   prek install
+   ```
+
+2. Replace the old hook with prek:
+   - Before using `--force`, check `pre-commit` and any `pre-commit.legacy` file in the directory returned above. Move any required checks to `prek.toml` before you replace the hook. `--force` also removes the legacy hook.
+   - If `core.hooksPath` comes from global, system, or command config, stop and review that setting first. Command config includes `GIT_CONFIG_COUNT` and `git -c`.
+     - If no repository-local or worktree-local hooks path is set, `--force` installs to the default directory, `$(git rev-parse --git-common-dir)/hooks`. The active hook stays unchanged. Check `pre-commit` and any `pre-commit.legacy` file in the default directory as well before using `--force`.
+
+   ```sh
+   prek install --force
+   ```
+
 ## GitHub workflow security
 
 Workflow actions are pinned to full commit SHAs. Keep the version comments with these pins so Dependabot can update them. Each Dependabot ecosystem has a seven-day cooldown for version updates.
