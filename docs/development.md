@@ -34,19 +34,29 @@ prek run --all-files
 
 ### Migrate from pre-commit
 
-A hook installed with `pre-commit install` still reads the removed `.pre-commit-config.yaml`. It can block commits with a missing-config error. A plain `prek install` keeps the old hook as `.git/hooks/pre-commit.legacy` and runs it too, so the error can remain.
+A hook installed with `pre-commit install` still reads the removed `.pre-commit-config.yaml`. It can block commits with a missing-config error. A plain `prek install` keeps the old hook as `pre-commit.legacy` in the active hook directory and runs it too, so the error can remain.
+
+Find the active Git hook directory from the checkout root:
+
+```sh
+git rev-parse --path-format=absolute --git-path hooks
+```
+
+This command accounts for `core.hooksPath` and linked worktrees. Use the returned directory for the checks below. To check the scope of a `core.hooksPath` setting, run `git config --show-scope --get core.hooksPath`.
 
 Choose one method:
 
-1. If pre-commit is still available, remove its hook, then install the prek hook:
+1. If pre-commit is still available and `core.hooksPath` is not set, remove any prek shim first, then replace the old hook. `prek uninstall` restores the legacy hook, if present, so `pre-commit uninstall` can remove it:
 
    ```sh
+   prek uninstall
    pre-commit uninstall
    prek install
    ```
 
 2. Replace the old hook with prek:
-   - Before using `--force`, check the existing hook and any `.git/hooks/pre-commit.legacy` file for checks you still need. Move any required checks to `prek.toml` before you replace the hook. `--force` also removes the legacy hook.
+   - Before using `--force`, check `pre-commit` and any `pre-commit.legacy` file in the directory returned above. Move any required checks to `prek.toml` before you replace the hook. `--force` also removes the legacy hook.
+   - If `core.hooksPath` comes from global or system config, stop and review that setting first. In this case, `--force` installs to the repository's default hooks directory and leaves the active shared hook unchanged.
 
    ```sh
    prek install --force
