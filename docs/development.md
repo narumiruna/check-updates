@@ -20,7 +20,7 @@ uvx --isolated --no-index --find-links dist check-updates --version
 
 `Cargo.toml` is the version source. `pyproject.toml` reads the version through maturin. Keep `Cargo.lock` and `uv.lock` in version control. The publish workflow builds and tests each platform wheel before publication. Cross-platform builds must pass in CI before release.
 
-The Docker image contains the native CLI and uv for automatic locking. It does not require Python to run the CLI. Source installs and `uv build` compile Rust; platform wheel installs do not.
+Source installs and `uv build` compile Rust; platform wheel installs do not.
 
 ## Git hooks
 
@@ -67,7 +67,7 @@ Choose one method:
 
 Workflow actions are pinned to full commit SHAs. Keep the version comments with these pins so Dependabot can update them. Each Dependabot ecosystem has a seven-day cooldown for version updates.
 
-Job names use kebab-case. CI cancels older runs for the same pull request or ref. Version-bump, container, and publication workflows serialize runs for the same ref without canceling an active run. Write permissions are limited to the jobs that need them. Checkouts do not persist credentials, and publication jobs disable uv caching.
+Job names use kebab-case. CI cancels older runs for the same pull request or ref. Version-bump and publication workflows serialize runs for the same ref without canceling an active run. Write permissions are limited to the jobs that need them. Checkouts do not persist credentials, and publication jobs disable uv caching.
 
 Validate workflow changes locally without triggering a release:
 
