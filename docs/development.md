@@ -22,6 +22,36 @@ uvx --isolated --no-index --find-links dist check-updates --version
 
 The Docker image contains the native CLI and uv for automatic locking. It does not require Python to run the CLI. Source installs and `uv build` compile Rust; platform wheel installs do not.
 
+## Git hooks
+
+Use prek with `prek.toml` for local Git hooks. If this checkout has an old pre-commit hook, follow [Migrate from pre-commit](#migrate-from-pre-commit) before running `prek install`.
+
+```sh
+uv tool install prek
+prek install
+prek run --all-files
+```
+
+### Migrate from pre-commit
+
+A hook installed with `pre-commit install` still reads the removed `.pre-commit-config.yaml`. It can block commits with a missing-config error. A plain `prek install` keeps the old hook as `.git/hooks/pre-commit.legacy` and runs it too, so the error can remain.
+
+Choose one method:
+
+1. If pre-commit is still available, remove its hook, then install the prek hook:
+
+   ```sh
+   pre-commit uninstall
+   prek install
+   ```
+
+2. Replace the old hook with prek:
+   - Before using `--force`, check the existing hook and any `.git/hooks/pre-commit.legacy` file for checks you still need. Move any required checks to `prek.toml` before you replace the hook. `--force` also removes the legacy hook.
+
+   ```sh
+   prek install --force
+   ```
+
 ## GitHub workflow security
 
 Workflow actions are pinned to full commit SHAs. Keep the version comments with these pins so Dependabot can update them. Each Dependabot ecosystem has a seven-day cooldown for version updates.
