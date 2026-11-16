@@ -56,7 +56,8 @@ Choose one method:
 
 2. Replace the old hook with prek:
    - Before using `--force`, check `pre-commit` and any `pre-commit.legacy` file in the directory returned above. Move any required checks to `prek.toml` before you replace the hook. `--force` also removes the legacy hook.
-   - If `core.hooksPath` comes from global or system config, stop and review that setting first. In this case, `--force` installs to the repository's default hooks directory and leaves the active shared hook unchanged.
+   - If `core.hooksPath` comes from global, system, or command config, stop and review that setting first. Command config includes `GIT_CONFIG_COUNT` and `git -c`.
+     - If no repository-local or worktree-local hooks path is set, `--force` installs to the default directory, `$(git rev-parse --git-common-dir)/hooks`. The active hook stays unchanged. Check `pre-commit` and any `pre-commit.legacy` file in the default directory as well before using `--force`.
 
    ```sh
    prek install --force
