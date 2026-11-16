@@ -22,7 +22,33 @@ uvx --isolated --no-index --find-links dist check-updates --version
 
 The Docker image contains the native CLI and uv for automatic locking. It does not require Python to run the CLI. Source installs and `uv build` compile Rust; platform wheel installs do not.
 
-### Release verification handoff
+## GitHub workflow security
+
+Workflow actions are pinned to full commit SHAs. Keep the version comments with these pins so Dependabot can update them. Each Dependabot ecosystem has a seven-day cooldown for version updates.
+
+Job names use kebab-case. CI cancels older runs for the same pull request or ref. Version-bump, container, and publication workflows serialize runs for the same ref without canceling an active run. Write permissions are limited to the jobs that need them. Checkouts do not persist credentials, and publication jobs disable uv caching.
+
+Validate workflow changes locally without triggering a release:
+
+```sh
+zizmor --pedantic .
+actionlint
+```
+
+## Release authentication
+
+The publish workflow uses PyPI Trusted Publishing, not `PYPI_TOKEN`. Before the next publication, a PyPI project owner must configure a GitHub trusted publisher for `check-updates` with these values:
+
+- Owner: `narumiruna`
+- Repository: `check-updates`
+- Workflow filename: `publish.yml`
+- Environment: leave empty; the workflow does not select a GitHub environment.
+
+Only the `publish` job, named `publish-pypi`, has `id-token: write`. It runs `uv publish --trusted-publishing always`, so publication fails if the trusted publisher is not configured. After a successful publication, remove the unused `PYPI_TOKEN` repository secret and revoke the old PyPI token.
+
+The version-bump workflow still requires `PAT_TOKEN` to push version commits and tags. Pushes made with that token can trigger the publication workflows; the workflow's `GITHUB_TOKEN` needs only read access.
+
+## Release verification handoff
 
 Local validation uses Linux x86-64, uv 0.13.0, local metadata servers, and inert wheel fixtures. After an authorized PR is pushed, maintainers must check the Linux, macOS, and Windows CI jobs, including wheel smoke tests. Non-host process, path, cleanup, and wheel behavior remain unverified until those jobs pass; do not treat local checks as cross-platform release readiness. Doctor remains explicitly unsupported on Windows.
 
