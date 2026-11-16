@@ -22,8 +22,6 @@ cargo install --path . --locked
 
 Release builds produce wheels for Linux (glibc 2.28 or newer, x86-64 and ARM64), macOS (Intel and Apple Silicon), and Windows (x86-64). Wheels do not require Rust. Installation from a source distribution requires a Rust toolchain and a C compiler. PyPI installation requires Python 3.10 or newer; the installed executable does not use Python at runtime.
 
-The Docker image contains the native CLI and uv for automatic locking. It does not require Python to run the CLI.
-
 ## Related documentation
 
 [Development](development.md) · [Automatic locking](locking.md#automatic-locking)
